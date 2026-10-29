@@ -269,3 +269,34 @@ def test_worktree_ciclo(ws):
     c.delete("/api/worktrees/wt1")
     assert not wt_api.exists()
     c.delete("/api/profiles/wt1")
+
+
+def test_rechaza_otro_origen(ws):
+    req = urllib.request.Request(ws["c"].base + "/api/services/api/up", method="POST",
+                                 headers={"Origin": "https://evil.example"})
+    with pytest.raises(urllib.error.HTTPError) as e:
+        urllib.request.urlopen(req, timeout=10)
+    assert e.value.code == 403
+    assert svc(ws["c"], "api")["status"] == "down"
+
+
+@pytest.mark.parametrize("name", ["../config", "a__b", "con espacio", 'x"y'])
+def test_nombre_de_perfil_invalido(ws, name):
+    body = {"name": name, "repos": {}, "services": [], "worktree": False}
+    assert ws["c"].post("/api/profiles", body, ok=False)[0] == 400
+    assert ws["c"].put("/api/profiles", body, ok=False)[0] == 400
+    assert (ws["dws"] / "config.toml").exists()
+
+
+def test_perfil_in_place_arranca_en_orden_del_perfil(ws):
+    c = ws["c"]
+    c.post("/api/profiles", {"name": "orden", "repos": {"api": "main", "worker": "main"},
+                             "services": ["api", "worker"], "worktree": False})
+    r = c.post("/api/profiles/orden/apply")
+    assert [n for n, _ in r["services"]] == ["api", "worker"], r
+    assert all(u["ok"] for _, u in r["services"]), r
+    assert c.get("/api/state")["active_profile"] == "orden"
+    for s in ("api", "worker"):
+        c.post(f"/api/services/{s}/down")
+    assert c.get("/api/state")["active_profile"] is None
+    c.delete("/api/profiles/orden")

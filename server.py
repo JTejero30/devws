@@ -9,11 +9,12 @@ import subprocess
 import threading
 import time
 import tomllib
+from contextlib import contextmanager
 from pathlib import Path
 
 import psutil
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -26,8 +27,21 @@ PROFILES_DIR = ROOT / "profiles"
 WT_DIR = ROOT / "worktrees"
 WEB_PORT = CONFIG.get("meta", {}).get("web_port", 5000)
 
-_lock = threading.Lock()
+NAME_RE = r"[A-Za-z0-9._-]+"
+
+_lock = threading.RLock()
 app = FastAPI()
+
+
+@app.middleware("http")
+async def same_origin_only(request: Request, call_next):
+    """Solo peticiones a 127.0.0.1/localhost desde la propia UI: cualquier web
+    abierta en el navegador podria si no lanzar POSTs (CSRF / DNS rebinding)."""
+    allowed = {f"127.0.0.1:{WEB_PORT}", f"localhost:{WEB_PORT}"}
+    origin = request.headers.get("origin")
+    if request.headers.get("host") not in allowed or (origin and origin.split("://", 1)[-1] not in allowed):
+        return JSONResponse({"detail": "origen no permitido"}, status_code=403)
+    return await call_next(request)
 
 
 def load_state() -> dict:
@@ -37,7 +51,26 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_FILE)
+
+
+@contextmanager
+def state_tx():
+    """load → modificar → save bajo _lock, para no pisar cambios de otros hilos.
+    No hacer dentro nada lento (git, kill, esperas de puerto)."""
+    with _lock:
+        state = load_state()
+        state.setdefault("services", {})
+        yield state
+        save_state(state)
+
+
+def check_name(name: str, what: str) -> str:
+    if not re.fullmatch(NAME_RE, name) or "__" in name:
+        raise HTTPException(400, f"nombre de {what} invalido: {name!r} (usa letras, numeros, _ . - y sin '__')")
+    return name
 
 
 def repos() -> list[dict]:
@@ -198,7 +231,7 @@ class RepoIn(BaseModel):
 @app.post("/api/repos")
 def api_repos_add(body: RepoIn):
     name = body.name.strip()
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+    if not re.fullmatch(NAME_RE, name):
         raise HTTPException(400, "nombre invalido (usa letras, numeros, _ . -)")
     path = body.path.strip()
     if not path:
@@ -207,7 +240,7 @@ def api_repos_add(body: RepoIn):
     if any(r["name"] == name for r in repos()):
         raise HTTPException(409, f"repo ya existe: {name}")
     d = (WORKSPACE_ROOT / path).resolve()
-    if not (d / ".git").exists() and not d.is_dir():
+    if not (d / ".git").exists():
         raise HTTPException(400, f"no hay repo git en {path} (relativo a {WORKSPACE_ROOT})")
     with _lock:
         cfg_file = ROOT / "config.toml"
@@ -294,6 +327,20 @@ def ps_command(pid: int) -> str:
 
 
 DEV_PROC_MARKERS = ("uvicorn", "node", "ng", "npm", "python", "fastapi")
+
+
+def is_dev_proc(pid: int) -> bool:
+    """Proceso de desarrollo si algun ejecutable/script de su cmdline se llama
+    como un marcador (antes se buscaba subcadena: "ng" casaba con "settings")."""
+    try:
+        cmdline = psutil.Process(pid).cmdline()
+    except psutil.Error:
+        return False
+    for tok in cmdline:
+        base = Path(tok).name.lower().removesuffix(".exe").removesuffix(".cmd")
+        if base in DEV_PROC_MARKERS or base.startswith(("python", "uvicorn")):
+            return True
+    return False
 
 # "address already in use" en macOS (48), Linux (98) y Windows (10048)
 ADDR_IN_USE = ("Errno 48", "Errno 98", "10048", "address already in use")
@@ -469,18 +516,18 @@ def api_up(name: str, force: bool = False):
             raise HTTPException(409, "un solo espacio de trabajo a la vez: "
                                 f"corren servicios de otro espacio ({', '.join(others)}). "
                                 "Bájalos antes (o usa force=true para cambiar de espacio)")
-        for oid in others:
-            oentry = state["services"].pop(oid, None)
+        with state_tx() as st:
+            gone = [st["services"].pop(oid, None) for oid in others]
+        for oentry in gone:
             if oentry:
                 kill_process(oentry["pid"])
-        save_state(state)
     killed = []
     port_pids_now = port_pids(port)
     if port_pids_now:
         blockers = []
         for pid in port_pids_now:
             cmd = ps_command(pid)
-            if any(m in cmd.lower() for m in DEV_PROC_MARKERS):
+            if is_dev_proc(pid):
                 kill_process(pid)
                 killed.append((pid, cmd[:60]))
             elif not force:
@@ -494,14 +541,13 @@ def api_up(name: str, force: bool = False):
                     "msg": f"el puerto {port} sigue ocupado tras matar {killed}"}
     # sin listener pero con sockets zombi (p. ej. CLOSED de un uvicorn --reload
     # anterior): no responde a connect, pero bloquea el bind con Errno 48
-    zombis = [p for p in port_server_pids(port)
-              if any(m in ps_command(p).lower() for m in DEV_PROC_MARKERS)]
+    zombis = [p for p in port_server_pids(port) if is_dev_proc(p)]
     for pid in zombis:
         kill_process(pid)
     if zombis and not wait_port_free(port):
         return {"ok": False, "error": "port_conflict",
                 "msg": f"el puerto {port} sigue bloqueado por pids {zombis} tras matarlos"}
-    return _start_service(svc, port, state, killed, name=name, wt_dir=wt_dir, path=p)
+    return _start_service(svc, port, killed, name=name, wt_dir=wt_dir, path=p)
 
 
 def log_tail(svc_id: str, chars: int = 4000) -> str:
@@ -522,7 +568,7 @@ def stray_pids(repo_name: str, exclude: set[int], wt_dir: Path | None = None) ->
     return out
 
 
-def _start_service(svc: dict, port: int, state: dict, killed: list,
+def _start_service(svc: dict, port: int, killed: list,
                    name: str | None = None, wt_dir: Path | None = None,
                    path: Path | None = None) -> dict:
     name = name or svc["name"]
@@ -540,11 +586,11 @@ def _start_service(svc: dict, port: int, state: dict, killed: list,
         if attempt == 1:
             with open(logf_path, "wb") as f:
                 f.write(f"=== up {name} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
-        logf = open(logf_path, "ab")
-        proc = subprocess.Popen(
-            cmd, cwd=p, stdout=logf, stderr=subprocess.STDOUT,
-            start_new_session=True, env=env,
-        )
+        with open(logf_path, "ab") as logf:
+            proc = subprocess.Popen(
+                cmd, cwd=p, stdout=logf, stderr=subprocess.STDOUT,
+                start_new_session=True, env=env,
+            )
         try:
             branch = git(p, "branch", "--show-current", timeout=10).strip()
         except Exception:
@@ -554,8 +600,8 @@ def _start_service(svc: dict, port: int, state: dict, killed: list,
                  "branch": branch}
         if wt_dir is not None:
             entry["wt"] = wt_dir.name
-        state["services"][name] = entry
-        save_state(state)
+        with state_tx() as st:
+            st["services"][name] = entry
         if wait_port(port, timeout=90):
             extra = f" (matado {len(killed)} proceso(s) previo(s))" if killed else ""
             return {"ok": True, "msg": f"up en :{port}{extra}", "pid": proc.pid}
@@ -574,18 +620,16 @@ def _start_service(svc: dict, port: int, state: dict, killed: list,
 
 @app.post("/api/services/{name}/down")
 def api_down(name: str):
-    svc = service(name.split("/")[-1])
-    with _lock:
-        state = load_state()
-        entry = state["services"].pop(name, None)
-        save_state(state)
+    service(name.split("/")[-1])
+    with state_tx() as st:
+        entry = st["services"].pop(name, None)
     if not entry:
         return {"ok": True, "msg": "no estaba gestionado por devws"}
     kill_process(entry["pid"])
-    remaining = any(e and pid_alive(e["pid"]) for e in state["services"].values())
-    if not remaining and state.get("active_profile"):
-        state["active_profile"] = None
-        save_state(state)
+    with state_tx() as st:
+        remaining = any(e and pid_alive(e["pid"]) for e in st["services"].values())
+        if not remaining and st.get("active_profile"):
+            st["active_profile"] = None
     return {"ok": True, "msg": "down"}
 
 
@@ -675,20 +719,28 @@ def profile_file(name: str) -> Path:
     return PROFILES_DIR / f"{name}.toml"
 
 
+def profile_services(prof: dict) -> list[str]:
+    """Servicios del perfil en su orden de arranque (lista vacia = todos)."""
+    known = [s["name"] for s in services()]
+    wanted = prof.get("services", {}).get("services") or known
+    return [s for s in wanted if s in known]
+
+
 def profile_body(req: ProfileIn, created_at: str | None = None) -> str:
     body = [
-        f'name = "{req.name}"',
-        f'created_at = "{created_at or time.strftime("%Y-%m-%d %H:%M")}"',
+        f'name = {toml_str(req.name)}',
+        f'created_at = {toml_str(created_at or time.strftime("%Y-%m-%d %H:%M"))}',
         f'worktree = {"true" if req.worktree else "false"}',
         "", "[repos]",
     ]
-    body += [f'"{r}" = "{b}"' for r, b in req.repos.items()]
-    body += ["", "[services]", "services = [" + ", ".join(f'"{s}"' for s in req.services) + "]"]
+    body += [f'{toml_str(r)} = {toml_str(b)}' for r, b in req.repos.items()]
+    body += ["", "[services]", "services = [" + ", ".join(toml_str(s) for s in req.services) + "]"]
     return "\n".join(body) + "\n"
 
 
 @app.post("/api/profiles")
 def api_profiles_save(req: ProfileIn):
+    check_name(req.name, "perfil")
     PROFILES_DIR.mkdir(exist_ok=True)
     f = profile_file(req.name)
     if f.exists():
@@ -699,6 +751,7 @@ def api_profiles_save(req: ProfileIn):
 
 @app.put("/api/profiles")
 def api_profiles_update(req: ProfileIn):
+    check_name(req.name, "perfil")
     f = profile_file(req.name)
     if not f.exists():
         raise HTTPException(404, f"perfil no existe: {req.name}")
@@ -709,9 +762,12 @@ def api_profiles_update(req: ProfileIn):
 
 @app.delete("/api/profiles/{name}")
 def api_profiles_delete(name: str):
-    f = PROFILES_DIR / f"{name}.toml"
+    f = profile_file(check_name(name, "perfil"))
     if f.exists():
         f.unlink()
+    with state_tx() as st:
+        if st.get("active_profile") == name:
+            st["active_profile"] = None
     return {"ok": True}
 
 
@@ -855,15 +911,10 @@ def api_profiles_apply(name: str):
             return {"checkout": [{"repo": it.repo, "ok": False, "error": msg} for it in items],
                     "services": [], "worktree": True}
     results = api_checkout(CheckoutReq(items=[CheckoutItem(repo=r, branch=b) for r, b in prof.get("repos", {}).items()]))
-    prof_svcs = prof.get("services", {}).get("services") or [s["name"] for s in services()]
-    ups = []
-    for s in services():
-        if s["repo"] in prof.get("repos", {}) and s["name"] in prof_svcs:
-            ups.append((s["name"], api_up(s["name"], force=True)))
-    with _lock:
-        state = load_state()
-        state["active_profile"] = name
-        save_state(state)
+    # orden de arranque = orden del perfil (el formulario lo promete asi)
+    ups = [(s, api_up(s, force=True)) for s in profile_services(prof)]
+    with state_tx() as st:
+        st["active_profile"] = name
     return {"checkout": results, "services": ups, "worktree": False}
 
 
