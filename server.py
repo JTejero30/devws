@@ -4,7 +4,6 @@ import json
 import os
 import re
 import shutil
-import signal
 import socket
 import subprocess
 import threading
@@ -12,6 +11,7 @@ import time
 import tomllib
 from pathlib import Path
 
+import psutil
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -71,33 +71,36 @@ def git(repo_dir: Path, *args: str, timeout: int = 90) -> str:
         raise RuntimeError(res.stderr.strip() or res.stdout.strip())
     return res.stdout
 
-def port_pids(port: int) -> list[int]:
-    res = subprocess.run(
-        ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
-        capture_output=True, text=True,
-    )
-    return [int(l) for l in res.stdout.split() if l.strip().isdigit()]
+def tcp_conns() -> list[tuple[int, int, str]]:
+    """(puerto local, pid, estado) de los sockets TCP visibles."""
+    try:
+        return [(c.laddr.port, c.pid, c.status)
+                for c in psutil.net_connections("tcp") if c.laddr and c.pid]
+    except psutil.AccessDenied:
+        # macOS sin root: solo se pueden ver los sockets de procesos propios
+        out = []
+        for proc in psutil.process_iter():
+            try:
+                out += [(c.laddr.port, proc.pid, c.status)
+                        for c in proc.net_connections("tcp") if c.laddr]
+            except psutil.Error:
+                continue
+        return out
+
+
+def port_pids(port: int, conns: list | None = None) -> list[int]:
+    conns = tcp_conns() if conns is None else conns
+    return sorted({pid for p, pid, st in conns if p == port and st == psutil.CONN_LISTEN})
 
 
 def port_server_pids(port: int) -> list[int]:
     """Pids que parecen servidores en el puerto pero sin socket LISTEN (p. ej.
     CLOSED de un uvicorn zombi): no aceptan conexiones pero sí bloquean el
-    bind con Errno 48. Ignora clientes conectados (ESTABLISHED) y los pids
+    bind (address already in use). Ignora conexiones ESTABLISHED y los pids
     propios de devws."""
-    res = subprocess.run(["lsof", "-nP", f"-iTCP:{port}"],
-                         capture_output=True, text=True)
-    out, seen = [], set()
-    for line in res.stdout.splitlines()[1:]:
-        parts = line.split()
-        # COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE [STATE]
-        if len(parts) < 9 or not parts[1].isdigit():
-            continue
-        pid = int(parts[1])
-        if parts[8] == "(ESTABLISHED)" or pid in seen or pid in (os.getpid(), os.getppid()):
-            continue
-        seen.add(pid)
-        out.append(pid)
-    return out
+    return sorted({pid for p, pid, st in tcp_conns()
+                   if p == port and st != psutil.CONN_ESTABLISHED
+                   and pid not in (os.getpid(), os.getppid())})
 
 
 def port_open(port: int) -> bool:
@@ -107,10 +110,10 @@ def port_open(port: int) -> bool:
 
 
 def pid_alive(pid: int) -> bool:
+    # ojo: os.kill(pid, 0) en Windows MATA el proceso; psutil es portable
     try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
+        return psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except psutil.Error:
         return False
 
 
@@ -284,37 +287,37 @@ def load_dotenv(repo_dir: Path) -> dict:
 
 
 def ps_command(pid: int) -> str:
-    res = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
-                         capture_output=True, text=True)
-    return res.stdout.strip()
+    try:
+        return " ".join(psutil.Process(pid).cmdline())
+    except psutil.Error:
+        return ""
 
 
 DEV_PROC_MARKERS = ("uvicorn", "node", "ng", "npm", "python", "fastapi")
 
-
-def child_pids(pid: int) -> list[int]:
-    res = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
-    return [int(l) for l in res.stdout.split() if l.strip().isdigit()]
+# "address already in use" en macOS (48), Linux (98) y Windows (10048)
+ADDR_IN_USE = ("Errno 48", "Errno 98", "10048", "address already in use")
 
 
 def kill_process(pid: int) -> None:
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        for child in child_pids(pid):
-            try:
-                os.kill(child, sig)
-            except ProcessLookupError:
-                pass
+    """SIGTERM al proceso y a todos sus descendientes; SIGKILL a los que sigan vivos."""
+    try:
+        root = psutil.Process(pid)
+        procs = [root, *root.children(recursive=True)]
+    except psutil.Error:
+        return
+    for p in procs:
         try:
-            os.killpg(pid, sig)
-        except (ProcessLookupError, PermissionError):
-            try:
-                os.kill(pid, sig)
-            except ProcessLookupError:
-                return
-        for _ in range(20):
-            if not pid_alive(pid):
-                return
-            time.sleep(0.25)
+            p.terminate()
+        except psutil.Error:
+            pass
+    _, alive = psutil.wait_procs(procs, timeout=5)
+    for p in alive:
+        try:
+            p.kill()
+        except psutil.Error:
+            pass
+    psutil.wait_procs(alive, timeout=5)
 
 
 def wait_port_free(port: int, timeout: float = 15.0) -> bool:
@@ -509,18 +512,13 @@ def log_tail(svc_id: str, chars: int = 4000) -> str:
 
 
 def stray_pids(repo_name: str, exclude: set[int], wt_dir: Path | None = None) -> list[int]:
-    res = subprocess.run(["ps", "axo", "pid=,command="], capture_output=True, text=True)
     needle = str(wt_dir) if wt_dir else repo_name
     out = []
-    for line in res.stdout.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) < 2 or not parts[0].isdigit():
+    for proc in psutil.process_iter(["cmdline"]):
+        cmd = " ".join(proc.info["cmdline"] or [])
+        if proc.pid in exclude or "uvicorn" not in cmd or needle not in cmd:
             continue
-        pid = int(parts[0])
-        cmd = parts[1]
-        if pid in exclude or "uvicorn" not in cmd or needle not in cmd:
-            continue
-        out.append(pid)
+        out.append(proc.pid)
     return out
 
 
@@ -563,7 +561,7 @@ def _start_service(svc: dict, port: int, state: dict, killed: list,
             return {"ok": True, "msg": f"up en :{port}{extra}", "pid": proc.pid}
         tail = log_tail(name)
         exclude.add(proc.pid)
-        if attempt == 1 and "Errno 48" in tail:
+        if attempt == 1 and any(m in tail for m in ADDR_IN_USE):
             strays = stray_pids(svc["repo"], exclude, wt_dir)
             for pid in strays:
                 kill_process(pid)
@@ -591,12 +589,12 @@ def api_down(name: str):
     return {"ok": True, "msg": "down"}
 
 
-def service_status(name: str, svc: dict, state: dict) -> dict:
+def service_status(name: str, svc: dict, state: dict, conns: list | None = None) -> dict:
     entry = state["services"].get(name)
     prof, _ = _split_svc_id(name)
     port = svc["port"]
     p = WT_DIR / f"{prof}__{svc['repo']}" if prof else repo_path(svc["repo"])
-    pids = port_pids(port)
+    pids = port_pids(port, conns)
     if entry and pid_alive(entry["pid"]) and pids:
         status = "up"
     elif entry and pid_alive(entry["pid"]):
@@ -626,7 +624,8 @@ def api_state():
     for prof in state.get("worktrees", {}):
         for s in services():
             ids.append(f"{prof}/{s['name']}")
-    return {"services": [service_status(i, service(i.split("/")[-1]), state) for i in ids],
+    conns = tcp_conns()
+    return {"services": [service_status(i, service(i.split("/")[-1]), state, conns) for i in ids],
             "active_profile": state.get("active_profile"),
             "worktrees": state.get("worktrees", {})}
 
