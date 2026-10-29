@@ -9,6 +9,9 @@ web_port = 5000
 name = "api-gateway"
 path = "api-gateway"
 kind = "python"
+# opcional: ficheros ignorados por git que se copian del repo original a cada
+# worktree nuevo (nunca sobrescribe), p. ej. el wiring que hoy se edita a mano:
+# copy = [".env", "wiring.toml"]
 
 [[repos]]
 name = "search-service"

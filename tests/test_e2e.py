@@ -61,7 +61,7 @@ def make_repo(root: Path, rel: str, files: dict[str, str], branches: list[str]) 
     sh(d, "git", "config", "user.email", "test@devws")
     sh(d, "git", "config", "user.name", "test")
     sh(d, "git", "config", "core.autocrlf", "false")
-    for name, content in {**files, ".gitignore": ".env\n.venv/\nnode_modules/\n__pycache__/\n"}.items():
+    for name, content in {**files, ".gitignore": ".env\n.venv/\nnode_modules/\n__pycache__/\nuv.lock\n"}.items():
         (d / name).write_text(content)
     sh(d, "git", "add", ".")
     sh(d, "git", "commit", "-q", "-m", "init")
@@ -148,6 +148,7 @@ web_port = {ports["web_ui"]}
 name = "api"
 path = "api"
 kind = "python"
+copy = [".env"]
 
 [[repos]]
 name = "worker"
@@ -187,17 +188,27 @@ name = "lib"
 consumers = ["api"]
 """)
     env = {**os.environ, "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]}
-    log = open(root / "server.log", "wb")
-    proc = subprocess.Popen([sys.executable, str(dws / "server.py")], cwd=dws,
-                            stdout=log, stderr=subprocess.STDOUT, env=env)
+    log = open(root / "server.log", "ab")
     c = Client(ports["web_ui"])
-    wait_for(lambda: fetch(ports["web_ui"]) is not None, 30, "server devws")
-    yield {"root": root, "dws": dws, "ports": ports, "c": c}
+    server = {}
+
+    def start():
+        server["proc"] = subprocess.Popen([sys.executable, str(dws / "server.py")], cwd=dws,
+                                          stdout=log, stderr=subprocess.STDOUT, env=env)
+        wait_for(lambda: fetch(ports["web_ui"]) is not None, 30, "server devws")
+
+    def stop():
+        server["proc"].terminate()
+        server["proc"].wait(10)
+        wait_for(lambda: fetch(ports["web_ui"]) is None, 10, "server devws parado")
+
+    start()
+    yield {"root": root, "dws": dws, "ports": ports, "c": c,
+           "restart": lambda: (stop(), start())}
     for s in c.get("/api/state")["services"]:
         if s["status"] in ("up", "starting"):
             c.post(f"/api/services/{urllib.parse.quote(s['id'], safe='')}/down", ok=False)
-    proc.terminate()
-    proc.wait(10)
+    stop()
     log.close()
 
 
@@ -250,15 +261,33 @@ def test_perfil_crud(ws):
     assert "p1" not in c.get("/api/profiles")
 
 
+def wt_info(c: Client, prof: str) -> dict | None:
+    return c.get("/api/state")["worktrees"].get(prof)
+
+
+def prepare(c: Client, prof: str, expect: str = "ok") -> dict:
+    """apply del perfil worktree y espera a que la preparacion termine."""
+    r = c.post(f"/api/profiles/{prof}/apply")
+    assert r["worktree"], r
+    w = wait_for(lambda: (w := wt_info(c, prof)) and w["status"] != "running" and w,
+                 180, f"preparacion de {prof}")
+    assert w["status"] == expect, (w, c.get(f"/api/logs/{prof}--prep")["lines"][-20:])
+    return w
+
+
 def test_worktree_ciclo(ws):
     c, ports, dws = ws["c"], ws["ports"], ws["dws"]
     c.post("/api/profiles", {"name": "wt1", "repos": {"api": "feat-a", "worker": "feat-a"},
                              "services": ["worker", "api"], "worktree": True})
-    r = c.post("/api/profiles/wt1/apply")
-    assert all(i["ok"] for i in r["checkout"]), r
+    w = prepare(c, "wt1")
+    assert w["repos"] == {"api": "feat-a", "worker": "feat-a"} and w["pending"] == []
     wt_api = dws / "worktrees" / "wt1__api"
     assert (wt_api / "BRANCH").read_text() == "feat-a"
-    wait_for(lambda: c.get("/api/state")["worktrees"]["wt1"]["ready"], 120, "deps del worktree")
+    assert (wt_api / ".venv").is_dir(), "uv sync no se ejecuto en el worktree"
+    assert (wt_api / ".env").read_text() == "DEVWS_TEST=1\n", 'copy = [".env"] copia el ignorado'
+    assert not (dws / "worktrees" / "wt1__worker" / ".env").exists(), "sin copy no se copia nada"
+    ids = [s["id"] for s in c.get("/api/state")["services"] if s.get("profile") == "wt1"]
+    assert ids == ["wt1/worker", "wt1/api"], "solo los servicios del perfil, en su orden"
     r = c.post("/api/services/wt/wt1/api/up?force=true")
     assert r["ok"] and "up en" in r.get("msg", ""), r
     assert fetch(ports["api"]) == str(wt_api)
@@ -300,3 +329,127 @@ def test_perfil_in_place_arranca_en_orden_del_perfil(ws):
         c.post(f"/api/services/{s}/down")
     assert c.get("/api/state")["active_profile"] is None
     c.delete("/api/profiles/orden")
+
+
+def git_out(d: Path, *args: str) -> str:
+    return sh(d, "git", *args).strip()
+
+
+def test_perfil_parcial_servicios_desde_el_original(ws):
+    c, ports, root, dws = ws["c"], ws["ports"], ws["root"], ws["dws"]
+    c.post("/api/profiles", {"name": "parcial", "repos": {"api": "feat-a"},
+                             "services": ["web", "api"], "worktree": True})
+    w = prepare(c, "parcial")
+    assert list(w["repos"]) == ["api"]
+    assert not (dws / "worktrees" / "parcial__web").exists(), "web no esta en el perfil: sin worktree"
+    assert c.post("/api/services/wt/parcial/web/up?force=true")["ok"]
+    assert fetch(ports["web"]) == str(root / "web")
+    assert svc(c, "parcial/web")["from_original"] is True
+    assert c.post("/api/services/wt/parcial/api/up?force=true")["ok"]
+    assert fetch(ports["api"]) == str(dws / "worktrees" / "parcial__api")
+    c.post("/api/worktrees/parcial/down")
+    wait_for(lambda: fetch(ports["web"]) is None and fetch(ports["api"]) is None, 15, "servicios caidos")
+    c.delete("/api/worktrees/parcial")
+    c.delete("/api/profiles/parcial")
+
+
+def test_rama_nueva_desde_base_sin_tracking(ws):
+    c, dws = ws["c"], ws["dws"]
+    c.post("/api/profiles", {"name": "nueva", "repos": {"api": "feat-nueva"}, "worktree": True,
+                             "bases": {"api": "feat-a"}, "services": ["api"]})
+    assert c.get("/api/profiles/nueva")["bases"] == {"api": "feat-a"}
+    prepare(c, "nueva")
+    d = dws / "worktrees" / "nueva__api"
+    assert git_out(d, "branch", "--show-current") == "feat-nueva"
+    assert (d / "BRANCH").read_text() == "feat-a", "debe partir de la base, no del HEAD del original"
+    res = subprocess.run(["git", "rev-parse", "--abbrev-ref", "@{u}"], cwd=d, capture_output=True)
+    assert res.returncode != 0, "una rama nueva no debe seguir a la rama base"
+    c.delete("/api/worktrees/nueva")
+    c.delete("/api/profiles/nueva")
+
+
+def test_rama_nueva_sin_base_parte_de_la_rama_por_defecto_de_origin(ws):
+    c, dws = ws["c"], ws["dws"]
+    worker = ws["root"] / "commons" / "worker"
+    sh(worker, "git", "checkout", "-q", "feat-a")  # el original en otra rama: no debe influir
+    try:
+        c.post("/api/profiles", {"name": "sinbase", "repos": {"worker": "feat-x"}, "worktree": True})
+        prepare(c, "sinbase")
+        assert not (dws / "worktrees" / "sinbase__worker" / "BRANCH").exists(), "debe partir de origin/main"
+        c.delete("/api/worktrees/sinbase")
+        c.delete("/api/profiles/sinbase")
+        assert "sinbase" not in c.get("/api/state")["worktrees"]
+    finally:
+        sh(worker, "git", "checkout", "-q", "main")
+
+
+def test_rama_abierta_en_otro_sitio_no_se_fuerza(ws):
+    c, dws = ws["c"], ws["dws"]
+    c.post("/api/profiles", {"name": "dup", "repos": {"api": "main"}, "worktree": True})
+    w = prepare(c, "dup", expect="error")
+    assert "ya esta abierta" in w["error"]
+    assert not (dws / "worktrees" / "dup__api").exists()
+    c.delete("/api/profiles/dup")
+
+
+def test_editar_perfil_y_sincronizar(ws):
+    c, dws = ws["c"], ws["dws"]
+    body = {"name": "sync", "repos": {"api": "feat-a"}, "services": ["api"], "worktree": True}
+    c.post("/api/profiles", body)
+    prepare(c, "sync")
+    c.put("/api/profiles", {**body, "repos": {"api": "feat-s", "worker": "feat-a"}, "bases": {"api": "main"}})
+    assert sorted(wt_info(c, "sync")["pending"]) == ["api", "worker"]
+    w = prepare(c, "sync")
+    assert w["pending"] == [] and w["repos"] == {"api": "feat-s", "worker": "feat-a"}
+    assert git_out(dws / "worktrees" / "sync__api", "branch", "--show-current") == "feat-s"
+    c.delete("/api/worktrees/sync")
+    c.delete("/api/profiles/sync")
+
+
+def test_borrar_worktree_con_cambios_pide_confirmacion(ws):
+    c, dws = ws["c"], ws["dws"]
+    c.post("/api/profiles", {"name": "sucio", "repos": {"worker": "feat-a"}, "worktree": True})
+    prepare(c, "sucio")
+    d = dws / "worktrees" / "sucio__worker"
+    (d / "nuevo.txt").write_text("trabajo sin commitear")
+    status, out = c.delete("/api/worktrees/sucio", ok=False)
+    assert status == 409 and "sin commitear" in out["detail"]
+    assert d.exists()
+    c.delete("/api/worktrees/sucio?force=true")
+    assert not d.exists()
+    assert "feat-a" in git_out(ws["root"] / "commons" / "worker", "branch", "--list", "feat-a"), \
+        "la rama sigue existiendo en el repo original"
+    c.delete("/api/profiles/sucio")
+
+
+def test_adoptar_huerfanos_en_un_perfil_existente(ws):
+    c, dws, root = ws["c"], ws["dws"], ws["root"]
+    c.post("/api/profiles", {"name": "adop", "repos": {"api": "feat-a"}, "worktree": True})
+    prepare(c, "adop")
+    sh(root / "commons" / "worker", "git", "worktree", "add", "-q", "-b", "feat-w",
+       str(dws / "worktrees" / "adop__worker"))
+    orphans = c.get("/api/worktrees/orphans")
+    assert [o["dir"] for o in orphans] == ["adop__worker"]
+    r = c.post("/api/worktrees/orphans/adop__worker/adopt")
+    assert r["profile"] == "adop"
+    assert c.get("/api/profiles/adop")["repos"] == {"api": "feat-a", "worker": "feat-w"}
+    w = wait_for(lambda: (w := wt_info(c, "adop")) and w["status"] != "running" and w, 120, "adopcion")
+    assert w["status"] == "ok" and set(w["repos"]) == {"api", "worker"}
+    assert c.get("/api/worktrees/orphans") == []
+    c.delete("/api/worktrees/adop")
+    c.delete("/api/profiles/adop")
+
+
+def test_preparacion_interrumpida_por_reinicio_permite_reintentar(ws):
+    c, dws = ws["c"], ws["dws"]
+    c.post("/api/profiles", {"name": "reini", "repos": {"worker": "feat-a"}, "worktree": True})
+    state_file = dws / "state.json"
+    st = json.loads(state_file.read_text())
+    st.setdefault("prep", {})["reini"] = {"status": "running", "step": "uv sync"}
+    state_file.write_text(json.dumps(st))
+    ws["restart"]()
+    w = wt_info(c, "reini")
+    assert w["status"] == "error" and "reintentar" in w["error"]
+    prepare(c, "reini")
+    c.delete("/api/worktrees/reini")
+    c.delete("/api/profiles/reini")

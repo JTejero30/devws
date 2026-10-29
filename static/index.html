@@ -32,19 +32,11 @@ button:hover { border-color:var(--accent); }
 button.primary { background:#1f6feb; border-color:#1f6feb; }
 button.danger:hover { border-color:var(--red); color:var(--red); }
 button:disabled { opacity:.4; cursor:default; }
-.log { background:#010409; border:1px solid var(--border); border-radius:6px; padding:8px;
-font-size:11px; height:180px; overflow-y:auto; white-space:pre-wrap; word-break:break-all;
-color:#7ee787; margin-top:6px; display:none; }
 .port { color:var(--dim); font-size:12px; min-width:64px; }
 .profiles-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
 .p-card { border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-bottom:10px; background:#0d1117; }
 .p-card h3 { margin:0 0 4px; font-size:14px; }
 .p-card .meta { color:var(--dim); font-size:11px; margin-bottom:8px; }
-.p-repo { display:flex; gap:8px; font-size:12px; padding:2px 0; }
-.p-repo .pn { width:200px; color:var(--dim); }
-.p-repo .pb { font-weight:600; }
-.p-svcs { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; }
-.p-svcs .badge { font-size:11px; }
 .p-svc { display:flex; gap:8px; align-items:center; font-size:12px; padding:2px 0; }
 .p-svc .pn { width:150px; color:var(--dim); }
 .p-actions { display:flex; gap:8px; margin-top:10px; }
@@ -62,7 +54,6 @@ width:min(960px, 92vw); height:min(700px, 85vh); display:flex; flex-direction:co
 padding:14px 16px; }
 #logModal.full .modal { width:100vw; height:100vh; border-radius:0; border:none; padding:10px 12px; }
 #logModal h2 { font-size:14px; margin:0 0 10px; }
-.ln-svc { color:#d2a8ff; font-weight:600; margin-right:8px; display:inline-block; min-width:92px; }
 #allGrid { flex:1; display:grid; gap:10px; min-height:0;
 grid-template-columns:repeat(auto-fit, minmax(360px, 1fr)); }
 .all-panel { display:flex; flex-direction:column; min-height:0; min-width:0;
@@ -85,12 +76,12 @@ font-size:12px; flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-
 .ln-warn { color:#d29922; }
 .ln-debug { color:#8b949e; }
 .ln-info { color:#58a6ff; }
-.log .ln-err, #logs .ln-err { color:#ff7b72; }
-.log .ln-warn { color:#d29922; }
-.log .ln-debug { color:#8b949e; }
 #toast.err { border-color:var(--red); }
 .wide { grid-column:1 / -1; }
 .badge.wt { color:#d2a8ff; border-color:#d2a8ff44; }
+.prep { font-size:12px; color:var(--yellow); margin-top:8px; }
+.prep.err { color:var(--red); }
+.prep a { color:var(--accent); margin-left:6px; }
 </style>
 </head>
 <body>
@@ -129,7 +120,7 @@ font-size:12px; flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-
 <div id="pfRepos"></div>
 <div id="pfServices" style="margin-top:8px"></div>
 <label style="display:flex;gap:6px;align-items:center;margin-top:10px;font-size:13px">
-<input type="checkbox" id="pfWorktree"> Perfil worktree (repos aislados en git worktrees; mismos puertos basicos; no toca los repos originales)
+<input type="checkbox" id="pfWorktree"> Perfil worktree (los repos incluidos van en git worktrees aislados; mismos puertos basicos; no toca los repos originales)
 </label>
 <div class="p-actions">
 <button class="primary" onclick="saveProfile()">Guardar</button>
@@ -168,12 +159,6 @@ const t = l.replace(/\u001b\[[0-9;]*m/g, "");
 return `<span class="${_lineClass(t)}">${esc(t)}</span>`;
 }).join("\n");
 }
-function colorizeAll(events) {
-return events.map(e => {
-const t = e.line.replace(/\u001b\[[0-9;]*m/g, "").replace(/\n$/, "");
-return `<span class="${_lineClass(t)}"><span class="ln-svc">${esc(e.svc)}</span> ${esc(t)}</span>`;
-}).join("\n");
-}
 const _stick = new WeakMap();
 function stickyScroll(el, force) {
 if (force || _stick.get(el) !== false) el.scrollTop = el.scrollHeight;
@@ -192,7 +177,7 @@ else if (el.scrollHeight - el.scrollTop - el.clientHeight < 40) _stick.set(el, t
 async function api(path, opts) {
 const r = await fetch(path, opts);
 const j = await r.json();
-if (!r.ok) throw new Error(j.detail || j.msg || JSON.stringify(j));
+if (!r.ok) { const e = new Error(j.detail || j.msg || JSON.stringify(j)); e.status = r.status; throw e; }
 return j;
 }
 function toast(msg, err) {
@@ -203,18 +188,6 @@ clearTimeout(toast._t); toast._t = setTimeout(() => t.style.display = "none", 60
 
 let repos = [], services = [];
 let wtState = {};
-let enabled = null;
-function enabledSet() {
-if (enabled === null) {
-const saved = JSON.parse(localStorage.getItem("devws_enabled") || "null");
-enabled = new Set(saved || services.map(s => s.name));
-}
-return enabled;
-}
-function setEnabled(name, on) {
-const s = enabledSet(); on ? s.add(name) : s.delete(name);
-localStorage.setItem("devws_enabled", JSON.stringify([...s]));
-}
 
 let activeProfile = null;
 
@@ -225,22 +198,24 @@ repos = r; services = st.services; activeProfile = st.active_profile || null;
 wtState = st.worktrees || {};
 } catch (e) { toast("error de conexión al server devws: " + e.message, true); return; }
 renderRepos();
-const sig = Object.entries(wtState).map(([k, v]) => `${k}:${v.ready}`).join(";")
-+ "|" + services.filter(s => s.wt).map(s => s.id + ":" + s.status).sort().join(",");
+// re-pinta las tarjetas si cambia cualquier cosa que muestran (antes solo
+// miraba los servicios worktree: las tarjetas in-place se quedaban viejas)
+const sig = JSON.stringify([wtState, activeProfile, services.map(s => s.id + ":" + s.status + ":" + s.repo_branch),
+repos.map(r => r.name + ":" + r.current)]);
 if (sig !== refresh._wtsig) { refresh._wtsig = sig; loadProfiles(); }
 loadOrphans();
 }
 
 function svcUpUrl(id) {
-const [p, n] = id.split("/");
+const [p, n] = id.includes("/") ? id.split("/") : [null, id];
 return p ? `/api/services/wt/${encodeURIComponent(p)}/${encodeURIComponent(n)}/up` : `/api/services/${encodeURIComponent(id)}/up`;
 }
 function svcDownUrl(id) {
-const [p, n] = id.split("/");
+const [p, n] = id.includes("/") ? id.split("/") : [null, id];
 return p ? `/api/services/wt/${encodeURIComponent(p)}/${encodeURIComponent(n)}/down` : `/api/services/${encodeURIComponent(id)}/down`;
 }
 function logUrl(id) {
-const [p, n] = id.split("/");
+const [p, n] = id.includes("/") ? id.split("/") : [null, id];
 return p ? `/api/logs/wt/${encodeURIComponent(p)}/${encodeURIComponent(n)}` : `/api/logs/${encodeURIComponent(id)}`;
 }
 
@@ -282,16 +257,10 @@ try { const r = await api(svcDownUrl(id), { method:"POST" }); toast(`${id}: ${r.
 catch (e) { toast(e.message, true); }
 setTimeout(refresh, 800);
 }
-const profileSvcOrder = {};
 async function wtToggle(profile) {
-let order = profileSvcOrder[profile];
-if (!order) {
-try { order = (await api(`/api/profiles/${encodeURIComponent(profile)}`)).services?.services || []; }
-catch { order = []; }
-profileSvcOrder[profile] = order;
-}
-let rows = services.filter(s => s.wt && s.profile === profile);
-rows = rows.sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
+// solo los servicios del perfil, en su orden de arranque (parar: orden inverso)
+const order = (wtState[profile] || {}).services || [];
+const rows = order.map(n => services.find(s => s.wt && s.profile === profile && s.name === n)).filter(Boolean);
 const anyRunning = rows.some(s => ["up", "starting"].includes(s.status));
 if (anyRunning) {
 for (const s of [...rows].reverse()) await svcDown(s.id);
@@ -306,24 +275,35 @@ setTimeout(() => svcUp(id, true), 1200);
 async function wtOpen(profile) {
 try {
 const r = await api(`/api/worktrees/${encodeURIComponent(profile)}/open`, { method: "POST" });
-toast(`VS Code: ${r.opened.length} carpeta(s) abiertas (new window)`);
+toast(`VS Code: ${r.folders.length} carpeta(s) abiertas (new window)`);
 } catch (e) { toast(e.message, true); }
 }
 
-async function wtRemove(profile) {
-if (!confirm(`¿Borrar el worktree "${profile}"? (se eliminan sus directorios y se bajan sus servicios)`)) return;
+// DELETE/POST que el server rechaza con 409 si hay cambios sin commitear:
+// se enseña el detalle y, si se confirma, se repite con force=true
+async function withForce(url, method, what) {
+try { return await api(url, { method }); }
+catch (e) {
+if (e.status !== 409 || !confirm(`${what}: ${e.message}\n\n¿Borrar igualmente y perder esos cambios?`)) throw e;
+return await api(url + (url.includes("?") ? "&" : "?") + "force=true", { method });
+}
+}
+
+async function wtRemove(profile, asked) {
+if (!asked && !confirm(`¿Borrar el worktree "${profile}"? (se bajan sus servicios y se eliminan sus directorios; las ramas se conservan)`)) return false;
 try {
-const r = await api(`/api/worktrees/${encodeURIComponent(profile)}`, { method: "DELETE" });
+const r = await withForce(`/api/worktrees/${encodeURIComponent(profile)}`, "DELETE", profile);
 toast(`worktree ${profile} eliminado` + (r.errors && r.errors.length ? " (aviso: " + r.errors.join("; ") + ")" : ""), r.errors && r.errors.length);
-} catch (e) { toast(e.message, true); }
-setTimeout(refresh, 800);
+return true;
+} catch (e) { toast(e.message, true); return false; }
+finally { setTimeout(refresh, 800); }
 }
 
 let editingProfile = null;
 let formSvcOrder = [];
 let formSvcSelected = new Set();
 
-function allServiceNames() { return services.map(s => s.name); }
+function allServiceNames() { return [...new Set(services.map(s => s.name))]; }
 
 async function loadOrphans() {
 let orph = [];
@@ -338,7 +318,7 @@ el.innerHTML = '<div class="row" style="gap:10px;align-items:center;margin-botto
 <span class="port">rama ${esc(o.branch || "?")}</span>
 ${o.dirty ? '<span class="badge dirty">dirty</span>' : ""}
 <span style="flex:1"></span>
-<button onclick="adoptOrphan('${esc(o.dir)}')">Adoptar (crear perfil ${esc(o.profile)})</button>
+<button onclick="adoptOrphan('${esc(o.dir)}')">Adoptar (en perfil ${esc(o.profile)})</button>
 <button class="danger" onclick="removeOrphan('${esc(o.dir)}')">✕ eliminar worktree</button>
 </div>`).join("");
 }
@@ -346,25 +326,24 @@ ${o.dirty ? '<span class="badge dirty">dirty</span>' : ""}
 async function adoptOrphan(dir) {
 try {
 const r = await api(`/api/worktrees/orphans/${encodeURIComponent(dir)}/adopt`, { method: "POST" });
-toast(`worktree adoptado: perfil "${r.profile}" en slot ${r.slot}`);
+toast(r.msg);
 refresh(); loadProfiles(); loadOrphans();
 } catch (e) { toast(e.message, true); }
 }
 
 async function removeOrphan(dir) {
-const [prof, rname] = dir.split(/__(?=[^_]+$)/);
-if (!confirm(`¿Borrar el worktree "${dir}"? (git worktree remove --force en ${rname})`)) return;
+if (!confirm(`¿Borrar el worktree "${dir}"? (la rama se conserva en el repo)`)) return;
 try {
-await api(`/api/worktrees/orphans/${encodeURIComponent(dir)}/remove`, { method: "POST" });
+await withForce(`/api/worktrees/orphans/${encodeURIComponent(dir)}/remove`, "POST", dir);
 toast(`worktree ${dir} eliminado`); loadOrphans();
 } catch (e) { toast(e.message, true); }
 }
 
 function profileCard(p) {
-const svcNames = (p.services && p.services.services) || allServiceNames();
-const wt = p.worktree && p.worktree !== "false";
+const svcNames = (p.services && p.services.services && p.services.services.length) ? p.services.services : allServiceNames();
+const wt = p.worktree === true;
 const wts = wtState[p.name];
-const runningSvc = n => services.find(s => (s.wt ? s.profile === p.name : activeProfile === p.name) && s.name === n);
+const runningSvc = n => services.find(s => (wt ? s.wt && s.profile === p.name : !s.wt && activeProfile === p.name) && s.name === n);
 const anyRunning = svcNames.some(n => { const st = runningSvc(n); return st && ["up", "starting"].includes(st.status); });
 const otherRunning = [...new Set(services.filter(s => s.wt && s.profile !== p.name && ["up", "starting"].includes(s.status)).map(s => s.profile))];
 const blocked = otherRunning.length > 0;
@@ -373,35 +352,51 @@ const st = runningSvc(n);
 const def = services.find(x => x.name === n);
 const repo = st ? st.repo : (def || {}).repo;
 const port = st ? st.port : (def || {}).port;
-const branch = wt ? (p.repos || {})[repo] : (repos.find(r => r.name === repo) || {}).current;
+// en un perfil worktree, los repos que no estan en el perfil corren desde el original
+const inWt = wt && (p.repos || {})[repo] !== undefined;
+const branch = (st && st.repo_branch) || (inWt ? p.repos[repo] : (repos.find(r => r.name === repo) || {}).current);
 const status = st ? st.status : "down";
 const cls = status === "up" ? "up" : status === "starting" ? "starting" : "down";
+const where = inWt ? ' <span class="badge wt" title="corre en un git worktree aislado">wt</span>'
+: wt ? ' <span class="badge" title="el repo no esta en el perfil: corre desde el repo original">original</span>' : "";
 return `<div class="p-svc">
-<span class="pn" title="repo">${esc(repo || n)}${wt ? ' <span class="badge wt" title="corre en un git worktree aislado">wt</span>' : ""}</span>
+<span class="pn" title="repo">${esc(repo || n)}${where}</span>
 <span style="flex:1;font-size:11px;font-family:monospace;color:var(--dim)" title="rama">${esc(branch || "—")}</span>
 <span style="font-size:11px;white-space:nowrap" title="servicio">${esc(n)} :${port || "?"}</span>
 <span class="badge ${cls}">${status}</span>
 ${st && status !== "down" ? `<button onclick="svcRestart('${esc(st.id)}')" title="baja y relanza este servicio">⟳ relanzar</button>` : ""}
 </div>`;
 }).join("");
-let mainBtn;
-if (!wt) mainBtn = `<button class="primary" ${blocked ? `disabled title="arrancado: ${otherRunning.join(", ")} — paralo primero"` : ""} onclick="applyProfile('${esc(p.name)}')">Cargar (legacy in-place)</button>`;
-else if (!wts) mainBtn = `<button class="primary" onclick="applyProfile('${esc(p.name)}')">Crear worktree</button>`;
-else if (!wts.ready) mainBtn = `<button disabled title="npm install / uv sync en curso">deps en curso…</button>`;
-else if (anyRunning) mainBtn = `<button class="danger" onclick="wtToggle('${esc(p.name)}')">⏹ Parar</button>`;
-else mainBtn = `<button class="primary" ${blocked ? `disabled title="arrancado: ${otherRunning.join(", ")} — paralo primero"` : ""} onclick="wtToggle('${esc(p.name)}')">▶ Arrancar</button>`;
+const nm = esc(p.name);
+const blockAttr = blocked ? `disabled title="arrancado: ${otherRunning.join(", ")} — paralo primero"` : "";
+let mainBtn, prep = "";
+if (!wt) mainBtn = `<button class="primary" ${blockAttr} onclick="applyProfile('${nm}')">Cargar (in-place)</button>`;
+else if (!wts) mainBtn = `<button class="primary" onclick="applyProfile('${nm}')">Crear worktree</button>`;
+else if (wts.status === "running") {
+mainBtn = `<button disabled>preparando…</button>`;
+prep = `<div class="prep">⏳ ${esc(wts.step || "")} <a href="#" onclick="openLogs('${nm}', '${nm}--prep');return false">ver log</a></div>`;
+} else if (wts.status === "error") {
+mainBtn = `<button class="primary" onclick="applyProfile('${nm}')" title="vuelve a crear/sincronizar lo que falte">⟳ reintentar</button>`;
+prep = `<div class="prep err">✕ ${esc(wts.error || "error")} <a href="#" onclick="openLogs('${nm}', '${nm}--prep');return false">ver log</a></div>`;
+}
+else if (anyRunning) mainBtn = `<button class="danger" onclick="wtToggle('${nm}')">⏹ Parar</button>`;
+else mainBtn = `<button class="primary" ${blockAttr} onclick="wtToggle('${nm}')">▶ Arrancar</button>`;
+const pending = wts && wts.status === "ok" && (wts.pending || []).length
+? `<button onclick="applyProfile('${nm}')" title="el perfil pide otra rama o mas repos que los worktrees en disco: ${esc(wts.pending.join(", "))}">⟳ sincronizar (${wts.pending.length})</button>` : "";
 const extraBtns = wt && wts ? `
-<button onclick="wtOpen('${esc(p.name)}')" title="abre en VS Code todos los worktrees del perfil">📂 abrir en VS Code</button>
-<button class="danger" onclick="wtRemove('${esc(p.name)}')" title="baja servicios y elimina los worktrees">✕ worktree</button>` : "";
+<button onclick="wtOpen('${nm}')" title="abre en VS Code todos los worktrees del perfil">📂 abrir en VS Code</button>
+<button class="danger" onclick="wtRemove('${nm}')" title="baja servicios y elimina los worktrees (las ramas se conservan)">✕ worktree</button>` : "";
 return `<div class="p-card" ${blocked ? 'style="opacity:.55"' : ""}>
-<h3>${esc(p.name)} ${wt ? '<span class="badge wt">worktree</span>' : ""} ${anyRunning ? '<span class="badge up">↑ arrancado</span>' : ""}</h3>
+<h3>${nm} ${wt ? '<span class="badge wt">worktree</span>' : ""} ${anyRunning ? '<span class="badge up">↑ arrancado</span>' : ""}</h3>
 <div class="meta">creado: ${esc(p.created_at || "?")}</div>
 <div class="p-svcs2">${svcRows || '<span class="badge">sin servicios</span>'}</div>
+${prep}
 <div class="p-actions">
 ${mainBtn}
-<button onclick="openLogs('${esc(p.name)}')">Ver logs</button>
-<button onclick="openProfileForm('${esc(p.name)}')">Editar</button>
-<button class="danger" onclick="deleteProfile('${esc(p.name)}')">Eliminar</button>
+${pending}
+<button onclick="openLogs('${nm}')">Ver logs</button>
+<button onclick="openProfileForm('${nm}')">Editar</button>
+<button class="danger" onclick="deleteProfile('${nm}')">Eliminar</button>
 ${extraBtns}
 </div>
 </div>`;
@@ -412,7 +407,6 @@ const names = await api("/api/profiles");
 const list = $("#profilesList");
 if (!names.length) { list.innerHTML = '<span style="color:var(--dim)">Sin perfiles. Crea uno a la derecha.</span>'; return; }
 const profs = await Promise.all(names.map(n => api(`/api/profiles/${encodeURIComponent(n)}`).catch(() => null)));
-profs.forEach(p => { if (p) profileSvcOrder[p.name] = (p.services && p.services.services) || []; });
 list.innerHTML = profs.filter(Boolean).map(p => profileCard(p)).join("");
 }
 
@@ -425,17 +419,17 @@ $("#pfName").disabled = !!name;
 $("#pfWorktree").checked = false;
 if (name) {
 api(`/api/profiles/${encodeURIComponent(name)}`).then(p => {
-renderFormRepos(p.repos || {});
-const cur = (p.services && p.services.services) || allServiceNames();
+renderFormRepos(p.repos || {}, p.bases || {});
+const cur = (p.services && p.services.services && p.services.services.length) ? p.services.services : allServiceNames();
 formSvcOrder = [...cur, ...allServiceNames().filter(n => !cur.includes(n))];
 formSvcSelected = new Set(cur);
 renderFormServices();
 $("#pfWorktree").checked = p.worktree === true;
 });
 } else {
-renderFormRepos(Object.fromEntries(repos.filter(r => r.current).map(r => [r.name, r.current])));
-formSvcOrder = [...enabledSet(), ...allServiceNames().filter(n => !enabledSet().has(n))];
-formSvcSelected = new Set(enabledSet());
+renderFormRepos({}, {});
+formSvcOrder = allServiceNames();
+formSvcSelected = new Set(formSvcOrder);
 renderFormServices();
 }
 }
@@ -449,14 +443,33 @@ const t = formSvcOrder[idx]; formSvcOrder[idx] = formSvcOrder[j]; formSvcOrder[j
 renderFormServices();
 }
 
-function renderFormRepos(current) {
-$("#pfRepos").innerHTML = repos.map(r => `
-<div class="row" style="margin-top:6px">
+// cada repo: no incluir | rama existente | rama nueva desde una base
+function renderFormRepos(current, bases) {
+$("#pfRepos").innerHTML = "<div style='color:var(--dim);font-size:12px;margin:4px 0'>Ramas por repo. "
++ "Sin incluir: en un perfil worktree sus servicios corren desde el repo original; en uno in-place no se toca su rama.</div>"
++ repos.filter(r => !r.error).map(r => {
+const branches = r.branches || [];
+const cur = current[r.name] || "";
+const isNew = !!cur && !branches.includes(cur);
+const base = bases[r.name] || ["develop", "main", "master"].find(b => branches.includes(b)) || r.current;
+return `<div class="row" style="margin-top:6px">
 <label>${esc(r.name)}</label>
-<select data-pfrepo="${esc(r.name)}">
-${(r.branches || []).map(b => `<option value="${esc(b)}" ${b === (current[r.name] || r.current) ? "selected" : ""}>${esc(b)}</option>`).join("")}
+<select data-pfrepo="${esc(r.name)}" onchange="pfRepoChange(this)">
+<option value="">— no incluir —</option>
+${branches.map(b => `<option value="${esc(b)}" ${b === cur ? "selected" : ""}>${esc(b)}</option>`).join("")}
+<option value="__new" ${isNew ? "selected" : ""}>+ rama nueva…</option>
 </select>
-</div>`).join("");
+<span class="pf-new" style="display:${isNew ? "flex" : "none"};gap:6px;align-items:center;width:100%;padding-left:210px">
+<input type="text" data-pfnew="${esc(r.name)}" placeholder="nombre de la rama nueva" value="${isNew ? esc(cur) : ""}">
+<span style="color:var(--dim);font-size:12px">desde</span>
+<select data-pfbase="${esc(r.name)}">${branches.map(b => `<option value="${esc(b)}" ${b === base ? "selected" : ""}>${esc(b)}</option>`).join("")}</select>
+</span>
+</div>`;
+}).join("");
+}
+
+function pfRepoChange(sel) {
+sel.parentElement.querySelector(".pf-new").style.display = sel.value === "__new" ? "flex" : "none";
 }
 
 function renderFormServices() {
@@ -482,10 +495,16 @@ editingProfile = null;
 
 function formPayload() {
 const name = $("#pfName").value.trim() || (editingProfile || "");
-const repos = {};
-document.querySelectorAll("[data-pfrepo]").forEach(sel => repos[sel.dataset.pfrepo] = sel.value);
+const repos = {}, bases = {};
+document.querySelectorAll("[data-pfrepo]").forEach(sel => {
+const r = sel.dataset.pfrepo;
+if (sel.value === "__new") {
+const b = document.querySelector(`[data-pfnew="${r}"]`).value.trim();
+if (b) { repos[r] = b; bases[r] = document.querySelector(`[data-pfbase="${r}"]`).value; }
+} else if (sel.value) repos[r] = sel.value;
+});
 const svc = formSvcOrder.filter(n => formSvcSelected.has(n));
-return { name, repos, services: svc, worktree: $("#pfWorktree").checked };
+return { name, repos, bases, services: svc, worktree: $("#pfWorktree").checked };
 }
 
 async function saveProfile() {
@@ -495,19 +514,18 @@ const method = editingProfile ? "PUT" : "POST";
 try {
 await api("/api/profiles", { method, headers: { "Content-Type": "application/json" },
 body: JSON.stringify(p) });
-toast(`perfil "${p.name}" ${editingProfile ? "actualizado" : "guardado"}`);
-profileSvcOrder[p.name] = p.services;
-closeProfileForm(); loadProfiles();
+toast(`perfil "${p.name}" ${editingProfile ? "actualizado" : "guardado"}`
++ (editingProfile && p.worktree && wtState[p.name] ? ": pulsa ⟳ sincronizar para aplicarlo a los worktrees" : ""));
+closeProfileForm(); refresh._wtsig = null; refresh(); loadProfiles();
 } catch (e) { toast(e.message, true); }
 }
 
 async function deleteProfile(name) {
 if (!confirm(`¿Eliminar el perfil "${name}"?`)) return;
-if (wtState[name]) {
-try { await api(`/api/worktrees/${encodeURIComponent(name)}`, { method: "DELETE" }); } catch (e) { toast("worktree: " + e.message, true); }
-}
-await api(`/api/profiles/${encodeURIComponent(name)}`, { method: "DELETE" });
-toast(`perfil "${name}" eliminado`); loadProfiles();
+if (wtState[name] && Object.keys(wtState[name].repos || {}).length && !(await wtRemove(name, true))) return;
+try { await api(`/api/profiles/${encodeURIComponent(name)}`, { method: "DELETE" }); }
+catch (e) { return toast(e.message, true); }
+toast(`perfil "${name}" eliminado`); refresh(); loadProfiles();
 }
 
 let applying = false;
@@ -516,7 +534,7 @@ if (applying) return;
 applying = true;
 const btns = [...document.querySelectorAll('button[onclick*="applyProfile"]')];
 btns.forEach(b => { b.disabled = true; if (!b.dataset.label) b.dataset.label = b.textContent; b.textContent = "Cargando…"; });
-toast(`${name}: cargando perfil (checkout + arranque de servicios; puede tardar un par de minutos)…`);
+toast(`${name}: cargando perfil…`);
 let isWt = false;
 try {
 const r = await api(`/api/profiles/${encodeURIComponent(name)}/apply`, { method: "POST" });
@@ -529,7 +547,7 @@ if (r.msg) toast(`${name}: ${r.msg}`);
 btns.forEach(b => { b.disabled = false; if (b.dataset.label) { b.textContent = b.dataset.label; delete b.dataset.label; } });
 applying = false;
 refresh();
-if (isWt) setTimeout(refresh, 3000);
+if (isWt) setTimeout(refresh, 1000);
 }
 
 function newProfile() { openProfileForm(null); }
@@ -562,37 +580,25 @@ let modalProfile = null;
 let modalServices = [];
 let allLogsOn = false;
 
-function openLogs(profileName) {
+function openLogs(profileName, tab) {
 api(`/api/profiles/${encodeURIComponent(profileName)}`).then(p => {
 modalProfile = profileName;
-const isWt = p.worktree === true && wtState[profileName];
+const isWt = p.worktree === true;
+const own = (p.services && p.services.services && p.services.services.length) ? p.services.services : allServiceNames();
 modalServices = isWt
-? services.filter(s => s.wt && s.profile === profileName).map(s => s.id)
-: ((p.services && p.services.services) || allServiceNames());
+? [...services.filter(s => s.wt && s.profile === profileName).map(s => s.id), `${profileName}--prep`]
+: own;
 renderLogTabs();
 $("#logModal").style.display = "flex";
 $("#logModalTitle").textContent = `Logs · perfil ${profileName}${isWt ? " (worktree)" : ""}`;
-selectLogTab(modalServices[0]);
+selectLogTab(tab || modalServices[0]);
 });
-}
-
-function openAllLogs() {
-allLogsOn = true;
-renderLogTabs();
-renderAllPanels();
-$("#logModal").classList.add("full");
-$("#logModal").style.display = "flex";
-$("#logModalTitle").textContent = "Logs · todos los servicios";
-$("#logTabs").style.display = "none";
-$("#modalLog").style.display = "none";
-$("#allGrid").style.display = "grid";
-pollAllLogs();
 }
 
 function allPanelId(s) { return "all-" + s.id.replace(/[^a-zA-Z0-9_-]/g, "_"); }
 
 function renderAllPanels() {
-$("#allGrid").innerHTML = services.filter(s => s.wt).map(s => {
+$("#allGrid").innerHTML = services.filter(s => modalServices.includes(s.id)).map(s => {
 const cls = s.status === "up" ? "up" : (s.status === "starting" ? "starting" : "down");
 const label = s.wt ? `${s.profile}/${s.name}` : s.name;
 return `<div class="all-panel">
@@ -626,9 +632,11 @@ modalTimer = setInterval(tick, 2500);
 function renderLogTabs() {
 if (allLogsOn) return;
 $("#logTabs").innerHTML = modalServices.map(n => {
-const st = services.find(s => s.name === n);
-const cls = [modalSvc === n ? "active" : "", st && (st.status === "up" || st.status === "starting") ? "" : "muted"].join(" ");
-return `<button class="${cls}" onclick="selectLogTab('${esc(n)}')">${esc(n)}${st ? " · :" + st.port : ""}</button>`;
+const st = services.find(s => s.id === n);
+const isPrep = n.endsWith("--prep");
+const cls = [modalSvc === n ? "active" : "", isPrep || (st && ["up", "starting"].includes(st.status)) ? "" : "muted"].join(" ");
+const label = isPrep ? "📜 preparación" : (st ? st.name : n);
+return `<button class="${cls}" onclick="selectLogTab('${esc(n)}')">${esc(label)}${st ? " · :" + st.port : ""}</button>`;
 }).join("") + `<button class="${modalSvc === "__all" ? "active" : ""}" onclick="selectLogTab('__all')">⧉ Todos</button>`;
 }
 

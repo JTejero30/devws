@@ -45,8 +45,11 @@ async def same_origin_only(request: Request, call_next):
 
 
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+    # bajo _lock: en Windows el replace de save_state falla (acceso denegado)
+    # si otro hilo tiene el fichero abierto leyendo
+    with _lock:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text())
     return {"services": {}}
 
 
@@ -162,6 +165,7 @@ def wait_port(port: int, timeout: float = 60.0) -> bool:
 class CheckoutItem(BaseModel):
     repo: str
     branch: str
+    base: str | None = None
 
 
 class CheckoutReq(BaseModel):
@@ -173,6 +177,8 @@ class ProfileIn(BaseModel):
     repos: dict[str, str]
     services: list[str] = []
     worktree: bool = False
+    # rama de partida para las ramas que aun no existen (repo -> rama base)
+    bases: dict[str, str] = {}
 
 
 def repo_status(name: str) -> dict:
@@ -268,7 +274,7 @@ def api_repos_del(name: str):
     in_use = [s["name"] for s in services() if s["repo"] == name]
     if in_use:
         raise HTTPException(409, f"tiene servicios asociados: {', '.join(in_use)}")
-    used = {prof for prof, w in load_state().get("worktrees", {}).items() if name in w.get("repos", {})}
+    used = {prof for prof, w in wt_profiles().items() if name in w["repos"]}
     if used:
         raise HTTPException(409, f"en uso por perfil(s): {', '.join(sorted(used))}")
     with _lock:
@@ -384,7 +390,43 @@ def _ref_exists(repo_dir: Path, ref: str) -> bool:
     return res.returncode == 0
 
 
-def do_checkout(name: str, branch: str) -> str:
+def resolve_base(p: Path, name: str, branch: str, base: str | None) -> str:
+    """Punto de partida de una rama nueva: origin/<base> (recien traida) o la
+    rama local <base>; sin base, la rama por defecto de origin. Nunca el HEAD
+    que tenga en ese momento el repo original."""
+    if base:
+        if _ref_exists(p, f"refs/remotes/origin/{base}"):
+            return f"origin/{base}"
+        if _ref_exists(p, f"refs/heads/{base}"):
+            return base
+        raise HTTPException(400, f"{name}: no existe la rama base {base}")
+    if _ref_exists(p, "refs/remotes/origin/HEAD"):
+        return "origin/HEAD"
+    raise HTTPException(400, f"{name}: {branch} no existe; indica desde que rama crearla")
+
+
+def branch_start(p: Path, name: str, branch: str, base: str | None) -> tuple[list[str], str]:
+    """(opciones, punto de partida) para checkout / worktree add de `branch`:
+    rama local, rama de origin con tracking, o rama nueva sin tracking."""
+    if _ref_exists(p, f"refs/heads/{branch}"):
+        return [], branch
+    if _ref_exists(p, f"refs/remotes/origin/{branch}"):
+        return ["-b", branch], f"origin/{branch}"
+    return ["--no-track", "-b", branch], resolve_base(p, name, branch, base)
+
+
+def branch_open_at(p: Path, branch: str, exclude: Path | None = None) -> str | None:
+    """Ruta del working tree (repo original u otro worktree) que tiene `branch`."""
+    path = None
+    for line in git(p, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            path = line.removeprefix("worktree ")
+        elif line == f"branch refs/heads/{branch}" and not (exclude and Path(path).resolve() == exclude.resolve()):
+            return path
+    return None
+
+
+def do_checkout(name: str, branch: str, base: str | None = None) -> str:
     p = repo_path(name)
     current = git(p, "branch", "--show-current").strip()
     if current == branch:
@@ -392,12 +434,8 @@ def do_checkout(name: str, branch: str) -> str:
     git(p, "fetch", "--prune", "--quiet", timeout=120)
     if git(p, "status", "--porcelain").strip():
         raise HTTPException(409, f"{name}: working tree dirty, no se hace checkout")
-    if _ref_exists(p, f"refs/heads/{branch}"):
-        git(p, "checkout", "-q", branch)
-    elif _ref_exists(p, f"refs/remotes/origin/{branch}"):
-        git(p, "checkout", "-q", "-b", branch, f"origin/{branch}")
-    else:
-        git(p, "checkout", "-q", "-b", branch)
+    opts, start = branch_start(p, name, branch, base)
+    git(p, "checkout", "-q", *opts, start)
     return branch
 
 
@@ -437,29 +475,53 @@ def wt_link_github(name: str, d: Path) -> None:
             pass
 
 
-def wt_ensure(name: str, branch: str, profile: str) -> Path:
+def wt_copy_ignored(name: str, d: Path) -> None:
+    """Copia al worktree los ficheros ignorados por git que el repo declara en
+    `copy` (config.toml). Nunca sobrescribe: el worktree puede tenerlos editados."""
+    cfg = next((r for r in repos() if r["name"] == name), {})
+    src_root = repo_path(name)
+    for rel in cfg.get("copy", []):
+        src, dst = src_root / rel, d / rel
+        if not src.exists() or dst.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+
+def wt_dir_for(profile: str, repo: str) -> Path:
+    return WT_DIR / f"{profile}__{repo}"
+
+
+def wt_ensure(name: str, branch: str, profile: str, base: str | None = None) -> Path:
+    """Deja el worktree del repo para el perfil en `branch` (lo crea si no existe).
+    Si la rama ya esta abierta en otro working tree falla: git no permite la
+    misma rama en dos sitios y forzarlo (--force) acaba en lios."""
     p = repo_path(name)
-    d = WT_DIR / f"{profile}__{name}"
-    wt_link_github(name, d) # idempotente: backfilla worktrees ya existentes
+    d = wt_dir_for(profile, name)
+    git(p, "fetch", "--prune", "--quiet", timeout=120)
     if d.exists():
         cur = git(d, "branch", "--show-current").strip()
         if cur != branch:
             if git(d, "status", "--porcelain").strip():
                 raise HTTPException(409, f"{name}: worktree con cambios locales; resuelve antes de pasar a {branch}")
-            git(d, "checkout", "-q", branch)
-        return d
-    git(p, "fetch", "--prune", "--quiet", timeout=120)
-    if _ref_exists(p, f"refs/heads/{branch}"):
-        rest = [branch]
-    elif _ref_exists(p, f"refs/remotes/origin/{branch}"):
-        rest = ["-b", branch, f"origin/{branch}"]
+            other = branch_open_at(p, branch, exclude=d)
+            if other:
+                raise HTTPException(409, f"{name}: la rama {branch} ya esta abierta en {other}")
+            opts, start = branch_start(p, name, branch, base)
+            git(d, "checkout", "-q", *opts, start)
     else:
-        rest = ["-b", branch]
-    try:
-        git(p, "worktree", "add", "-q", str(d), *rest, timeout=300)
-    except RuntimeError:
-        git(p, "worktree", "add", "-q", "--force", str(d), *rest, timeout=300)
+        git(p, "worktree", "prune")
+        other = branch_open_at(p, branch)
+        if other:
+            raise HTTPException(409, f"{name}: la rama {branch} ya esta abierta en {other}; "
+                                     "usa otra rama o cambia la de alli")
+        opts, start = branch_start(p, name, branch, base)
+        git(p, "worktree", "add", "-q", *opts, str(d), start, timeout=300)
     wt_link_github(name, d)
+    wt_copy_ignored(name, d)
     return d
 
 
@@ -468,7 +530,7 @@ def api_checkout(req: CheckoutReq):
     results = []
     for item in req.items:
         try:
-            do_checkout(item.repo, item.branch)
+            do_checkout(item.repo, item.branch, item.base)
             results.append({"repo": item.repo, "ok": True, "branch": item.branch})
         except (HTTPException, RuntimeError) as e:
             results.append({"repo": item.repo, "ok": False,
@@ -490,22 +552,23 @@ def uv_sync_many(targets: list[str]) -> None:
             pass
 
 
-def _svc_ctx(name: str, state: dict):
+def _svc_ctx(name: str):
+    """Servicio, perfil, puerto, directorio de trabajo y worktree (None si el
+    servicio corre desde el repo original: su repo no esta en el perfil)."""
     svc = service(name.split("/")[-1])
     prof, _ = _split_svc_id(name)
-    port = svc["port"]
     p = repo_path(svc["repo"])
-    wt_dir = None
-    if prof:
-        wt_dir = WT_DIR / f"{prof}__{svc['repo']}"
-        if wt_dir.exists():
-            p = wt_dir
-    return svc, prof, port, p, wt_dir
+    wt_dir = wt_dir_for(prof, svc["repo"]) if prof else None
+    if wt_dir is not None and wt_dir.is_dir():
+        p = wt_dir
+    else:
+        wt_dir = None
+    return svc, prof, svc["port"], p, wt_dir
 
 
 @app.post("/api/services/{name}/up")
 def api_up(name: str, force: bool = False):
-    svc, prof, port, p, wt_dir = _svc_ctx(name, load_state())
+    svc, prof, port, p, wt_dir = _svc_ctx(name)
     state = load_state()
     entry = state["services"].get(name)
     if entry and pid_alive(entry["pid"]) and not force:
@@ -637,7 +700,7 @@ def service_status(name: str, svc: dict, state: dict, conns: list | None = None)
     entry = state["services"].get(name)
     prof, _ = _split_svc_id(name)
     port = svc["port"]
-    p = WT_DIR / f"{prof}__{svc['repo']}" if prof else repo_path(svc["repo"])
+    _, _, _, p, wt_dir = _svc_ctx(name)
     pids = port_pids(port, conns)
     if entry and pid_alive(entry["pid"]) and pids:
         status = "up"
@@ -654,6 +717,7 @@ def service_status(name: str, svc: dict, state: dict, conns: list | None = None)
     if prof:
         out["wt"] = True
         out["profile"] = prof
+        out["from_original"] = wt_dir is None
     try:
         out["repo_branch"] = git(p, "branch", "--show-current", timeout=5).strip() or None
     except Exception:
@@ -661,26 +725,33 @@ def service_status(name: str, svc: dict, state: dict, conns: list | None = None)
     return out
 
 
+def service_ids(state: dict, wts: dict) -> list[str]:
+    """Servicios base + los de cada perfil worktree (solo los del perfil) + los
+    que sigan corriendo aunque ya no esten en su perfil (para poder bajarlos)."""
+    ids = [s["name"] for s in services()]
+    for prof, w in wts.items():
+        ids += [f"{prof}/{s}" for s in w["services"]]
+    known = {s["name"] for s in services()}
+    ids += [i for i in state["services"] if i not in ids and i.split("/")[-1] in known]
+    return ids
+
+
 @app.get("/api/state")
 def api_state():
     state = load_state()
-    ids = [s["name"] for s in services()]
-    for prof in state.get("worktrees", {}):
-        for s in services():
-            ids.append(f"{prof}/{s['name']}")
+    wts = wt_profiles()
+    for prof, w in wts.items():
+        w["pending"] = wt_pending(prof)
     conns = tcp_conns()
-    return {"services": [service_status(i, service(i.split("/")[-1]), state, conns) for i in ids],
+    return {"services": [service_status(i, service(i.split("/")[-1]), state, conns)
+                         for i in service_ids(state, wts)],
             "active_profile": state.get("active_profile"),
-            "worktrees": state.get("worktrees", {})}
+            "worktrees": wts}
 
 
 @app.get("/api/logs/tail")
 def api_logs_tail(lines: int = 200):
-    state = load_state()
-    ids = [s["name"] for s in services()]
-    for prof in state.get("worktrees", {}):
-        for s in services():
-            ids.append(f"{prof}/{s['name']}")
+    ids = service_ids(load_state(), wt_profiles())
     events = []
     for i in ids:
         f = log_file_for(i)
@@ -709,14 +780,21 @@ def api_profiles_list():
 
 @app.get("/api/profiles/{name}")
 def api_profile_get(name: str):
-    f = PROFILES_DIR / f"{name}.toml"
-    if not f.exists():
+    prof = load_profile(name)
+    if prof is None:
         raise HTTPException(404, f"perfil no existe: {name}")
-    return tomllib.load(open(f, "rb"))
+    return prof
 
 
 def profile_file(name: str) -> Path:
     return PROFILES_DIR / f"{name}.toml"
+
+
+def load_profile(name: str) -> dict | None:
+    f = profile_file(name)
+    if not f.exists():
+        return None
+    return tomllib.loads(f.read_text())
 
 
 def profile_services(prof: dict) -> list[str]:
@@ -734,8 +812,17 @@ def profile_body(req: ProfileIn, created_at: str | None = None) -> str:
         "", "[repos]",
     ]
     body += [f'{toml_str(r)} = {toml_str(b)}' for r, b in req.repos.items()]
+    bases = {r: b for r, b in req.bases.items() if r in req.repos and b}
+    if bases:
+        body += ["", "[bases]"] + [f'{toml_str(r)} = {toml_str(b)}' for r, b in bases.items()]
     body += ["", "[services]", "services = [" + ", ".join(toml_str(s) for s in req.services) + "]"]
     return "\n".join(body) + "\n"
+
+
+def profile_in(name: str, prof: dict) -> ProfileIn:
+    return ProfileIn(name=name, repos=prof.get("repos", {}), worktree=bool(prof.get("worktree")),
+                     services=prof.get("services", {}).get("services", []),
+                     bases=prof.get("bases", {}))
 
 
 @app.post("/api/profiles")
@@ -752,11 +839,10 @@ def api_profiles_save(req: ProfileIn):
 @app.put("/api/profiles")
 def api_profiles_update(req: ProfileIn):
     check_name(req.name, "perfil")
-    f = profile_file(req.name)
-    if not f.exists():
+    old = load_profile(req.name)
+    if old is None:
         raise HTTPException(404, f"perfil no existe: {req.name}")
-    old = tomllib.load(open(f, "rb"))
-    f.write_text(profile_body(req, old.get("created_at")))
+    profile_file(req.name).write_text(profile_body(req, old.get("created_at")))
     return {"ok": True}
 
 
@@ -768,52 +854,145 @@ def api_profiles_delete(name: str):
     with state_tx() as st:
         if st.get("active_profile") == name:
             st["active_profile"] = None
+        st.get("prep", {}).pop(name, None)
     return {"ok": True}
 
 
-def wt_prep(profile: str, repo_branches: dict[str, str]) -> None:
-    for rname in repo_branches:
-        d = WT_DIR / f"{profile}__{rname}"
-        if not d.exists():
-            continue
-        kind = next((r["kind"] for r in repos() if r["name"] == rname), "python")
+# --- perfiles worktree -------------------------------------------------------
+# Fuente de verdad: el perfil (profiles/*.toml, worktree = true) + lo que hay en
+# disco (worktrees/{perfil}__{repo}). state.json solo guarda el progreso de la
+# preparacion en state["prep"][perfil] = {status: running|ok|error, step, error}.
+
+
+def wt_profiles() -> dict[str, dict]:
+    """Perfiles worktree con algun worktree en disco (o preparandose)."""
+    prep = load_state().get("prep", {})
+    out = {}
+    if not PROFILES_DIR.exists():
+        return out
+    for f in sorted(PROFILES_DIR.glob("*.toml")):
         try:
-            if kind == "npm":
-                subprocess.run(["npm", "install", "--no-audit", "--no-fund"],
-                               cwd=d, capture_output=True, text=True, timeout=1800)
-            else:
-                r = subprocess.run(["uv", "sync"], cwd=d, capture_output=True, text=True, timeout=900)
-                if r.returncode != 0:
-                    # registry de paquetes caido: reintentar con la cachera local (wheels de otros repos)
-                    subprocess.run(["uv", "sync", "--offline"], cwd=d, capture_output=True, text=True, timeout=900)
+            prof = tomllib.loads(f.read_text())
+        except tomllib.TOMLDecodeError:
+            continue
+        if not prof.get("worktree"):
+            continue
+        on_disk = {r: b for r, b in prof.get("repos", {}).items() if wt_dir_for(f.stem, r).is_dir()}
+        pr = prep.get(f.stem, {})
+        if not on_disk and pr.get("status") not in ("running", "error"):
+            continue
+        out[f.stem] = {"repos": on_disk, "services": profile_services(prof),
+                       "status": pr.get("status", "ok"), "step": pr.get("step"),
+                       "error": pr.get("error"), "ready": pr.get("status", "ok") == "ok"}
+    return out
+
+
+def wt_pending(profile: str) -> list[str]:
+    """Repos del perfil cuyo worktree falta o esta en otra rama: hay que sincronizar."""
+    out = []
+    for r, b in (load_profile(profile) or {}).get("repos", {}).items():
+        d = wt_dir_for(profile, r)
+        try:
+            if not d.is_dir() or git(d, "branch", "--show-current", timeout=5).strip() != b:
+                out.append(r)
         except Exception:
-            pass
-    with _lock:
-        st = load_state()
-        if profile in st.get("worktrees", {}):
-            st["worktrees"][profile]["ready"] = True
-            save_state(st)
+            out.append(r)
+    return out
+
+
+def wt_dirty(d: Path) -> int:
+    """Ficheros con cambios sin commitear (incluye no versionados no ignorados)."""
+    try:
+        return len(git(d, "status", "--porcelain").splitlines())
+    except RuntimeError:
+        return 0
+
+
+def _set_prep(profile: str, **info) -> None:
+    with state_tx() as st:
+        st.setdefault("prep", {})[profile] = info
+
+
+def wt_sync(profile: str) -> None:
+    """Crea o actualiza los worktrees del perfil e instala dependencias. Corre
+    en segundo plano: progreso en state["prep"], salida en logs/{perfil}--prep.log.
+    Un repo que falla no para al resto; el perfil acaba en error si alguno falla."""
+    prof = load_profile(profile) or {}
+    bases = prof.get("bases", {})
+    LOGS_DIR.mkdir(exist_ok=True)
+    log = log_file_for(f"{profile}--prep")
+    log.write_text(f"=== preparar {profile} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+
+    def note(msg: str) -> None:
+        with open(log, "a") as fh:
+            fh.write(f"\n--- {time.strftime('%H:%M:%S')} {msg}\n")
+
+    def run(cmd: list[str], cwd: Path, timeout: int) -> int:
+        with open(log, "ab") as fh:
+            return subprocess.run([shutil.which(cmd[0]) or cmd[0], *cmd[1:]], cwd=cwd,
+                                  stdout=fh, stderr=subprocess.STDOUT, timeout=timeout).returncode
+
+    errors = []
+    for rname, branch in prof.get("repos", {}).items():
+        try:
+            _set_prep(profile, status="running", step=f"{rname}: worktree en {branch}")
+            note(f"{rname}: worktree en {branch}")
+            d = wt_ensure(rname, branch, profile, bases.get(rname))
+            kind = next((r["kind"] for r in repos() if r["name"] == rname), "python")
+            cmd = ["npm", "install", "--no-audit", "--no-fund"] if kind == "npm" else ["uv", "sync"]
+            _set_prep(profile, status="running", step=f"{rname}: {' '.join(cmd[:2])}")
+            note(f"{rname}: {' '.join(cmd)}")
+            rc = run(cmd, d, 1800 if kind == "npm" else 900)
+            if rc != 0 and kind != "npm":
+                # registry de paquetes caido: reintentar con la cache local (wheels de otros repos)
+                note(f"{rname}: uv sync --offline")
+                rc = run(["uv", "sync", "--offline"], d, 900)
+            if rc != 0:
+                raise RuntimeError(f"instalacion de dependencias fallida (codigo {rc})")
+        except (HTTPException, RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            msg = str(e.detail) if isinstance(e, HTTPException) else str(e)
+            note(f"ERROR {rname}: {msg}")
+            errors.append(f"{rname}: {msg}")
+    note("terminado con errores" if errors else "listo")
+    if errors:
+        _set_prep(profile, status="error", error="; ".join(errors))
+    else:
+        _set_prep(profile, status="ok")
+
+
+def wt_start_sync(profile: str) -> None:
+    with state_tx() as st:
+        if st.get("prep", {}).get(profile, {}).get("status") == "running":
+            raise HTTPException(409, f"{profile}: ya se esta preparando")
+        st.setdefault("prep", {})[profile] = {"status": "running", "step": "empezando"}
+    threading.Thread(target=wt_sync, args=(profile,), daemon=True).start()
+
+
+def reset_interrupted_prep() -> None:
+    """Una preparacion 'running' al arrancar el servidor murio con el anterior."""
+    with state_tx() as st:
+        for info in st.get("prep", {}).values():
+            if info.get("status") == "running":
+                info.update(status="error", step=None,
+                            error="interrumpida al reiniciar devws; pulsa reintentar")
 
 
 def orphan_worktrees() -> list[dict]:
-    registered = set()
-    for prof, w in load_state().get("worktrees", {}).items():
-        for r in w.get("repos", {}):
-            registered.add(f"{prof}__{r}")
+    registered = {wt_dir_for(prof, r).name for prof, w in wt_profiles().items() for r in w["repos"]}
     out = []
     if not WT_DIR.exists():
         return out
     for d in sorted(WT_DIR.iterdir()):
         if not d.is_dir() or "__" not in d.name or d.name in registered:
             continue
+        # los perfiles no pueden llevar "__": el primero separa perfil y repo
         prof, _, rname = d.name.partition("__")
         try:
             branch = git(d, "branch", "--show-current").strip() or None
-            dirty = bool(git(d, "status", "--porcelain").strip())
         except Exception:
             continue
         out.append({"dir": d.name, "profile": prof, "repo": rname,
-                    "branch": branch, "dirty": dirty})
+                    "branch": branch, "dirty": wt_dirty(d) > 0})
     return out
 
 
@@ -827,90 +1006,84 @@ def api_wt_adopt(dir: str):
     if "__" not in dir or not (WT_DIR / dir).is_dir():
         raise HTTPException(404, f"worktree no existe: {dir}")
     prof, _, rname = dir.partition("__")
+    check_name(prof, "perfil")
     try:
         repo_path(rname)
     except HTTPException:
         raise HTTPException(404, f"repo desconocido: {rname}")
     branch = git(WT_DIR / dir, "branch", "--show-current").strip()
-    with _lock:
-        state = load_state()
-        wts = state.setdefault("worktrees", {})
-        if prof in wts:
-            raise HTTPException(409, f"ya hay un perfil worktree llamado {prof}")
-        wts[prof] = {"ready": False, "repos": {rname: branch},
-                     "created_at": time.strftime("%Y-%m-%d %H:%M")}
-        save_state(state)
-    wt_link_github(rname, WT_DIR / dir)
-    f = profile_file(prof)
-    if not f.exists():
-        body = [f'name = "{prof}"', f'created_at = "{time.strftime("%Y-%m-%d %H:%M")}"',
-                'worktree = true', "", "[repos]", f'"{rname}" = "{branch}"',
-                "", "[services]",
-                "services = [" + ", ".join(f'"{s["name"]}"' for s in services() if s["repo"] == rname) + "]"]
-        f.write_text("\n".join(body) + "\n")
-    threading.Thread(target=wt_prep, args=(prof, {rname: branch}), daemon=True).start()
+    if not branch:
+        raise HTTPException(409, f"{dir}: el worktree no esta en ninguna rama (detached)")
+    old = load_profile(prof)
+    if old is not None and not old.get("worktree"):
+        raise HTTPException(409, f"ya existe un perfil in-place llamado {prof}")
+    if old is None:
+        req = ProfileIn(name=prof, repos={rname: branch}, worktree=True,
+                        services=[s["name"] for s in services() if s["repo"] == rname])
+    else:
+        # se suma al perfil worktree existente (varios repos del mismo perfil)
+        req = profile_in(prof, old)
+        req.repos = {**req.repos, rname: branch}
+    PROFILES_DIR.mkdir(exist_ok=True)
+    profile_file(prof).write_text(profile_body(req, old.get("created_at") if old else None))
+    wt_start_sync(prof)
     return {"ok": True, "profile": prof,
-            "msg": "perfil adoptado; comprobando deps en segundo plano"}
+            "msg": f"{rname} adoptado en el perfil {prof}; comprobando deps en segundo plano"}
+
+
+def wt_remove_dirs(dirs: list[tuple[str, Path]], force: bool) -> list[str]:
+    """git worktree remove de cada (repo, dir). Sin force, si alguno tiene cambios
+    sin commitear no se borra nada (409). Las ramas y sus commits no se pierden."""
+    dirty = [f"{d.name} ({n} fichero(s))" for _, d in dirs if (n := wt_dirty(d))]
+    if dirty and not force:
+        raise HTTPException(409, "cambios sin commitear en " + ", ".join(dirty)
+                            + ": se perderian al borrar")
+    errs = []
+    for rname, d in dirs:
+        try:
+            git(repo_path(rname), "worktree", "remove", "--force", str(d), timeout=120)
+        except (RuntimeError, HTTPException) as e:
+            errs.append(f"{rname}: {e.detail if isinstance(e, HTTPException) else e}")
+    return errs
 
 
 @app.post("/api/worktrees/orphans/{dir}/remove")
-def api_wt_orphan_remove(dir: str):
+def api_wt_orphan_remove(dir: str, force: bool = False):
     d = WT_DIR / dir
-    if not d.is_dir():
+    if "__" not in dir or not d.is_dir():
         raise HTTPException(404, f"worktree no existe: {dir}")
     _, _, rname = dir.partition("__")
-    try:
-        git(repo_path(rname), "worktree", "remove", "--force", str(d), timeout=120)
-    except RuntimeError as e:
-        raise HTTPException(500, f"no se pudo eliminar: {e}")
+    errs = wt_remove_dirs([(rname, d)], force)
+    if errs:
+        raise HTTPException(500, f"no se pudo eliminar: {errs[0]}")
     return {"ok": True}
 
 
 @app.post("/api/profiles/{name}/apply")
 def api_profiles_apply(name: str):
-    f = PROFILES_DIR / f"{name}.toml"
-    if not f.exists():
+    prof = load_profile(name)
+    if prof is None:
         raise HTTPException(404, f"perfil no existe: {name}")
-    prof = tomllib.load(open(f, "rb"))
-    is_wt = bool(prof.get("worktree"))
+    for r in prof.get("repos", {}):
+        repo_path(r)
+    if prof.get("worktree"):
+        # crear / sincronizar: ramas cambiadas, repos nuevos, deps; en segundo plano
+        wt_start_sync(name)
+        return {"checkout": [], "services": [], "worktree": True,
+                "msg": "preparando worktrees en segundo plano (ver log de preparacion)"}
     state = load_state()
-    if is_wt:
-        wts = state.setdefault("worktrees", {})
-        if name in wts:
-            return {"checkout": [], "services": [], "worktree": True,
-                    "msg": "worktree ya aplicado"}
-    else:
-        other = state.get("active_profile")
-        if other and other != name:
-            running = [n for n, e in state["services"].items() if e and pid_alive(e["pid"])]
-            if running:
-                raise HTTPException(409, f"perfil activo: {other} (corriendo: {', '.join(running)}). "
-                                    f"Baja los servicios antes de cargar otro perfil")
-        elif other == name:
-            # ya es el perfil activo: idempotente, no relanza checkouts/servicios
-            running = [n for n, e in state["services"].items() if e and pid_alive(e["pid"])]
-            if running:
-                return {"checkout": [], "services": [], "worktree": False,
-                        "msg": f"perfil {name} ya activo (corriendo: {', '.join(running)})"}
-    if is_wt:
-        items = [CheckoutItem(repo=r, branch=b) for r, b in prof.get("repos", {}).items()]
-        results = []
-        try:
-            for it in items:
-                wt_ensure(it.repo, it.branch, name)
-                results.append({"repo": it.repo, "ok": True, "branch": it.branch})
-            wts[name] = {"ready": False,
-                         "repos": dict(prof.get("repos", {})),
-                         "created_at": time.strftime("%Y-%m-%d %H:%M")}
-            save_state(state)
-            threading.Thread(target=wt_prep, args=(name, dict(prof.get("repos", {}))), daemon=True).start()
-            return {"checkout": results, "services": [], "worktree": True,
-                    "msg": "worktree creado; instalando dependencias en segundo plano"}
-        except (HTTPException, RuntimeError) as e:
-            msg = str(e.detail) if isinstance(e, HTTPException) else str(e)
-            return {"checkout": [{"repo": it.repo, "ok": False, "error": msg} for it in items],
-                    "services": [], "worktree": True}
-    results = api_checkout(CheckoutReq(items=[CheckoutItem(repo=r, branch=b) for r, b in prof.get("repos", {}).items()]))
+    other = state.get("active_profile")
+    running = [n for n, e in state["services"].items() if e and pid_alive(e["pid"])]
+    if other and other != name and running:
+        raise HTTPException(409, f"perfil activo: {other} (corriendo: {', '.join(running)}). "
+                            f"Baja los servicios antes de cargar otro perfil")
+    if other == name and running:
+        # ya es el perfil activo: idempotente, no relanza checkouts/servicios
+        return {"checkout": [], "services": [], "worktree": False,
+                "msg": f"perfil {name} ya activo (corriendo: {', '.join(running)})"}
+    bases = prof.get("bases", {})
+    results = api_checkout(CheckoutReq(items=[CheckoutItem(repo=r, branch=b, base=bases.get(r))
+                                              for r, b in prof.get("repos", {}).items()]))
     # orden de arranque = orden del perfil (el formulario lo promete asi)
     ups = [(s, api_up(s, force=True)) for s in profile_services(prof)]
     with state_tx() as st:
@@ -934,15 +1107,14 @@ def api_wt_logs(profile: str, name: str, lines: int = 150):
 
 
 def wt_down_profile(profile: str) -> list:
-    state = load_state()
+    with state_tx() as st:
+        gone = [(sid, st["services"].pop(sid)) for sid in list(st["services"])
+                if sid.startswith(f"{profile}/")]
     out = []
-    for s in services():
-        entry = state["services"].get(f"{profile}/{s['name']}")
+    for sid, entry in gone:
         if entry:
-            del state["services"][f"{profile}/{s['name']}"]
-            save_state(state)
             kill_process(entry["pid"])
-            out.append((s["name"], {"ok": True, "msg": "down"}))
+        out.append((sid.split("/", 1)[1], {"ok": True, "msg": "down"}))
     return out
 
 
@@ -951,11 +1123,10 @@ WS_DIR = ROOT / "workspaces"
 
 @app.post("/api/worktrees/{name}/open")
 def api_wt_open(name: str):
-    state = load_state()
-    w = state.get("worktrees", {}).get(name)
+    w = wt_profiles().get(name)
     if not w:
         raise HTTPException(404, f"worktree no existe: {name}")
-    dirs = [str(WT_DIR / f"{name}__{r}") for r in w.get("repos", {}) if (WT_DIR / f"{name}__{r}").is_dir()]
+    dirs = [str(wt_dir_for(name, r)) for r in w["repos"]]
     if not dirs:
         raise HTTPException(404, f"sin directorios de worktree en disco para: {name}")
     code = shutil.which("code") or next((p for p in ("/opt/homebrew/bin/code", "/usr/local/bin/code") if Path(p).exists()), None)
@@ -970,30 +1141,25 @@ def api_wt_open(name: str):
 
 @app.post("/api/worktrees/{name}/down")
 def api_wt_down(name: str):
-    state = load_state()
-    if name not in state.get("worktrees", {}):
+    if name not in wt_profiles():
         raise HTTPException(404, f"worktree no existe: {name}")
     return {"ok": True, "services": wt_down_profile(name)}
 
 
 @app.delete("/api/worktrees/{name}")
-def api_wt_remove(name: str):
-    state = load_state()
-    w = state.get("worktrees", {}).get(name)
+def api_wt_remove(name: str, force: bool = False):
+    w = wt_profiles().get(name)
     if not w:
         raise HTTPException(404, f"worktree no existe: {name}")
+    if w["status"] == "running":
+        raise HTTPException(409, f"{name}: se esta preparando; espera a que termine")
+    dirs = [(r, wt_dir_for(name, r)) for r in w["repos"]]
+    if any(wt_dirty(d) for _, d in dirs) and not force:
+        wt_remove_dirs(dirs, force=False)  # lanza el 409 con el detalle
     wt_down_profile(name)
-    state["worktrees"].pop(name, None)
-    save_state(state)
-    errs = []
-    for rname, rbranch in w.get("repos", {}).items():
-        d = WT_DIR / f"{name}__{rname}"
-        if not d.exists():
-            continue
-        try:
-            git(repo_path(rname), "worktree", "remove", "--force", str(d), timeout=120)
-        except RuntimeError as e:
-            errs.append(f"{rname}: {e}")
+    errs = wt_remove_dirs(dirs, force=True)
+    with state_tx() as st:
+        st.get("prep", {}).pop(name, None)
     return {"ok": True, "errors": errs}
 
 
@@ -1002,6 +1168,7 @@ def index():
     return FileResponse(ROOT / "static" / "index.html")
 
 
+reset_interrupted_prep()
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
