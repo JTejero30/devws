@@ -113,7 +113,7 @@ font-size:12px; flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-
 <div class="card-head">
 <h2>Espacios de trabajo</h2>
 <button class="primary" onclick="openProfileForm(null)">+ Nuevo</button>
-<span class="hint">Un espacio = qué rama de cada repo + qué servicios. ▶ Arrancar lo prepara todo y levanta los servicios.</span>
+<span class="hint">Un espacio = qué rama de cada repo + qué servicios. Arrancar lo prepara todo y levanta los servicios.</span>
 </div>
 <div class="p-form" id="profileForm" style="display:none">
 <h3 id="formTitle">Nuevo espacio</h3>
@@ -158,7 +158,7 @@ font-size:12px; flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-
 <div style="display:flex;align-items:center;gap:12px">
 <h2 id="logModalTitle">Logs</h2>
 <span style="flex:1"></span>
-<button onclick="closeLogs()">✕ cerrar</button>
+<button onclick="closeLogs()">Cerrar</button>
 </div>
 <div class="log-tabs" id="logTabs"></div>
 <pre id="modalLog"></pre>
@@ -275,14 +275,14 @@ const job = busyJob();
 if (job) {
 const [name, j] = job;
 return setActive("busy", `<b>${esc(name)}</b>: ${esc(j.step || "trabajando…")}`
-+ ` <button class="link" onclick="openLogs('${esc(name)}', 'actividad')">📜 actividad</button>`);
++ ` <button class="link" onclick="openLogs('${esc(name)}', 'actividad')">actividad</button>`);
 }
 const runningProf = Object.values(profiles).find(isRunning);
 if (runningProf) {
 const ids = profSvcs(runningProf).map(n => svcOf(runningProf, n)).filter(Boolean);
 const up = ids.filter(s => s.status === "up").length;
 return setActive("on", `<b>${esc(runningProf.name)}</b> arrancado · ${up}/${profSvcs(runningProf).length} servicios arriba`
-+ ` <button class="stop" onclick="stopProfile('${esc(runningProf.name)}')">⏹ Parar</button>`);
++ ` <button class="stop" onclick="stopProfile('${esc(runningProf.name)}')">Parar</button>`);
 }
 const loose = services.filter(s => ["up", "starting"].includes(s.status) && s.pid);
 if (loose.length) return setActive("on", `servicios sueltos arriba: ${loose.map(s => esc(s.id)).join(", ")}`);
@@ -301,8 +301,8 @@ const bases = p.bases || {};
 const wts = wtState[p.name];
 
 const mode = wt
-? `🌿 <b>Worktrees aislados</b> · ${wts ? "creados en .devws/worktrees" : "se crean al arrancar"} · tus repos no se tocan`
-: `📁 <b>Repos originales</b> · al arrancar hace checkout de estas ramas`;
+? `<b>Worktrees aislados</b> · ${wts ? "creados en .devws/worktrees" : "se crean al arrancar"} · tus repos no se tocan`
+: `<b>Repos originales</b> · al arrancar hace checkout de estas ramas`;
 
 const repoLines = Object.keys(pr).length
 ? Object.entries(pr).map(([r, b]) => `<div class="p-line"><span class="k">${esc(r)}</span><code>${esc(b)}</code>`
@@ -318,34 +318,34 @@ const status = s ? s.status : "down";
 const where = wt ? (pr[def.repo] !== undefined ? '<span class="badge wt">worktree</span>' : '<span class="badge">original</span>') : "";
 return `<div class="p-line"><span class="k">${esc(n)} <span class="hint">:${def.port || "?"}</span></span>
 ${where}<span class="badge ${status}">${STATUS[status] || status}</span>
-${status === "up" ? `<a href="http://127.0.0.1:${def.port}" target="_blank" class="hint">abrir ↗</a>` : ""}
+${status === "up" ? `<a href="http://127.0.0.1:${def.port}" target="_blank" class="hint">abrir</a>` : ""}
 <span style="flex:1"></span>
-${s && status !== "down" && !working ? `<button class="link" onclick="svcRestart('${esc(s.id)}')" title="baja y relanza este servicio">⟳ relanzar</button>` : ""}
+${s && status !== "down" && !working ? `<button class="link" onclick="svcRestart('${esc(s.id)}')" title="baja y relanza este servicio">relanzar</button>` : ""}
 </div>`;
 }).join("");
 
 let statusLine = "";
-if (working) statusLine = `<div class="status-line busy">⏳ ${esc(job.step || "trabajando…")} <a href="#" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
-else if (job && job.status === "error") statusLine = `<div class="status-line err">✕ ${job.action === "stop" ? "al parar" : "al arrancar"}: ${esc(job.error)} <a href="#" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
-else if (wt && wts && (wts.pending || []).length) statusLine = `<div class="status-line warn">⚠ ${esc(wts.pending.join(", "))}: el perfil pide otra rama; se aplica al ${running ? "volver a " : ""}arrancar</div>`;
+if (working) statusLine = `<div class="status-line busy">${esc(job.step || "trabajando…")} <a href="#" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
+else if (job && job.status === "error") statusLine = `<div class="status-line err">${job.action === "stop" ? "Error al parar" : "Error al arrancar"}: ${esc(job.error)} <a href="#" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
+else if (wt && wts && (wts.pending || []).length) statusLine = `<div class="status-line warn">${esc(wts.pending.join(", "))}: el perfil pide otra rama; se aplica al ${running ? "volver a " : ""}arrancar</div>`;
 
 const nm = esc(p.name);
 const primary = running
-? `<button class="stop" ${working || anyBusy ? "disabled" : ""} onclick="stopProfile('${nm}')">⏹ Parar</button>`
-: `<button class="primary" ${anyBusy ? "disabled" : ""} onclick="startProfile('${nm}')">${working ? "⏳ …" : "▶ Arrancar"}</button>`;
-const wtBtns = wt && wts ? `<button class="link" onclick="wtOpen('${nm}')" title="abre en VS Code las carpetas de este espacio">📂 VS Code</button>
-<button class="link" ${working || running ? "disabled" : ""} onclick="wtRemove('${nm}')" title="borra las carpetas de worktree (las ramas se conservan; se recrean al arrancar)">🗑 borrar worktrees</button>` : "";
+? `<button class="stop" ${working || anyBusy ? "disabled" : ""} onclick="stopProfile('${nm}')">Parar</button>`
+: `<button class="primary" ${anyBusy ? "disabled" : ""} onclick="startProfile('${nm}')">${working ? "…" : "Arrancar"}</button>`;
+const wtBtns = wt && wts ? `<button class="link" onclick="wtOpen('${nm}')" title="abre en VS Code las carpetas de este espacio">VS Code</button>
+<button class="link" ${working || running ? "disabled" : ""} onclick="wtRemove('${nm}')" title="borra las carpetas de worktree (las ramas se conservan; se recrean al arrancar)">borrar worktrees</button>` : "";
 
 return `<div class="p-card ${working ? "busy" : running ? "running" : ""}">
-<h3>${nm} ${running ? '<span class="badge up">● arrancado</span>' : ""} ${working ? '<span class="badge starting">trabajando</span>' : ""}</h3>
+<h3>${nm} ${running ? '<span class="badge up">arrancado</span>' : ""} ${working ? '<span class="badge starting">trabajando</span>' : ""}</h3>
 <div class="mode">${mode}</div>
 <div class="sect">Ramas</div>${repoLines}${rest}
 <div class="sect">Servicios (en orden de arranque)</div>${svcLines || '<div class="p-line hint">sin servicios</div>'}
 ${statusLine}
 <div class="p-actions">
 ${primary}
-<button class="link" onclick="openLogs('${nm}')">📜 logs</button>
-<button class="link" ${working ? "disabled" : ""} onclick="openProfileForm('${nm}')">✎ editar</button>
+<button class="link" onclick="openLogs('${nm}')">logs</button>
+<button class="link" ${working ? "disabled" : ""} onclick="openProfileForm('${nm}')">editar</button>
 ${wtBtns}
 <span style="flex:1"></span>
 <button class="link danger" ${working || running ? "disabled" : ""} onclick="deleteProfile('${nm}')">eliminar</button>
@@ -434,7 +434,7 @@ el.innerHTML = '<div class="hint" style="margin-bottom:4px">Carpetas de worktree
 ${o.dirty ? '<span class="badge dirty">cambios sin commitear</span>' : ""}
 <span style="flex:1"></span>
 <button onclick="adoptOrphan('${esc(o.dir)}')">Añadir al espacio ${esc(o.profile)}</button>
-<button class="danger" onclick="removeOrphan('${esc(o.dir)}')">🗑 borrar</button>
+<button class="danger" onclick="removeOrphan('${esc(o.dir)}')">borrar</button>
 </div>`).join("");
 }
 async function adoptOrphan(dir) {
@@ -545,7 +545,7 @@ if (!Object.keys(p.repos).length && !confirm("No has incluido ningún repo: los 
 try {
 await api("/api/profiles", { method: editingProfile ? "PUT" : "POST",
 headers: { "Content-Type": "application/json" }, body: JSON.stringify(p) });
-toast(`espacio "${p.name}" ${editingProfile ? "actualizado" : "creado"}: pulsa ▶ Arrancar para usarlo`);
+toast(`espacio "${p.name}" ${editingProfile ? "actualizado" : "creado"}: pulsa Arrancar para usarlo`);
 closeProfileForm(); await loadProfiles(); refresh();
 } catch (e) { toast(e.message, true); }
 }
@@ -654,9 +654,9 @@ $("#logTabs").innerHTML = modalServices.map(id => {
 const isAct = id.endsWith("--actividad");
 const s = services.find(x => x.id === id);
 const cls = [modalSvc === id ? "active" : "", isAct || (s && ["up", "starting"].includes(s.status)) ? "" : "muted"].join(" ");
-const label = isAct ? "📜 actividad" : (s ? s.name : id.split("/").pop());
+const label = isAct ? "actividad" : (s ? s.name : id.split("/").pop());
 return `<button class="${cls}" onclick="selectLogTab('${esc(id)}')">${esc(label)}${s ? " · :" + s.port : ""}</button>`;
-}).join("") + `<button class="${modalSvc === "__all" ? "active" : ""}" onclick="selectLogTab('__all')">⧉ todos</button>`;
+}).join("") + `<button class="${modalSvc === "__all" ? "active" : ""}" onclick="selectLogTab('__all')">todos</button>`;
 }
 function selectLogTab(id) {
 modalSvc = id;

@@ -67,7 +67,7 @@ const branch = () => { try { return execSync("git branch --show-current").toStri
 
 function card(x) {
   if (!x) return "";
-  if (x.error) return `<div class="c err">✕ ${esc(x.error)}</div>`;
+  if (x.error) return `<div class="c err">error: ${esc(x.error)}</div>`;
   const wt = x.cwd.includes("worktrees") ? '<span class="wt">worktree</span>' : '<span class="og">original</span>';
   return `<div class="c"><b>${esc(x.service)}</b> ${wt}<br>rama <code>${esc(x.branch)}</code> · ${esc(x.message)}
 <div class="cwd">${esc(x.cwd)}</div></div>` + card(x.downstream);
@@ -95,7 +95,7 @@ REPOS = [
     ("demo-db", "commons/demo-db", "python", 5432, None,
      {"main": "base de datos v1", "develop": "base de datos v2 (migracion nueva)", "feat-demo": "db con tabla extra"}),
     ("demo-api", "demo-api", "python", 8000, 5432,
-     {"main": "api estable", "develop": "api develop", "feat-demo": "api con endpoint nuevo ✨"}),
+     {"main": "api estable", "develop": "api develop", "feat-demo": "api con endpoint nuevo"}),
     ("demo-gw", "demo-gw", "python", 8001, 8000,
      {"main": "gateway estable", "develop": "gateway develop", "feat-demo": "gateway con cache"}),
     ("demo-web", "demo-web", "npm", 4200, 8001,
