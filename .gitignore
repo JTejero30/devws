@@ -1,0 +1,9 @@
+.venv/
+state.json
+logs/
+__pycache__/
+.pytest_cache/
+uv.lock
+.DS_Store
+worktrees/
+workspaces/
