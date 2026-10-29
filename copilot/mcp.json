@@ -1,0 +1,7 @@
+// Copiar a <workspace>/.vscode/mcp.json (la carpeta que contiene .devws).
+// El puerto es [meta] web_port de config.toml. devws tiene que estar arrancado.
+{
+  "servers": {
+    "devws": { "type": "http", "url": "http://127.0.0.1:5000/mcp" }
+  }
+}

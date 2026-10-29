@@ -502,3 +502,64 @@ def test_error_al_arrancar_se_ve_en_el_trabajo(ws):
     assert c.get("/api/state")["active_profile"] is None
     assert all(s["status"] == "down" for s in c.get("/api/state")["services"]), "no arranca servicios si falla"
     c.delete("/api/profiles/roto")
+
+
+def mcp_rpc(c: Client, method: str, params: dict | None = None) -> dict:
+    """JSON-RPC contra /mcp como lo haria un cliente MCP (Copilot): sin Origin."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}).encode()
+    req = urllib.request.Request(c.base + "/mcp", data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/json, text/event-stream"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        out = json.loads(r.read())
+    assert "error" not in out, out
+    return out["result"]
+
+
+def mcp_tool(c: Client, tool: str, **args) -> tuple[bool, dict | str]:
+    r = mcp_rpc(c, "tools/call", {"name": tool, "arguments": args})
+    text = r["content"][0]["text"]
+    return (True, text) if r.get("isError") else (False, json.loads(text))
+
+
+def test_mcp_crea_amplia_y_borra_un_espacio(ws):
+    c, dws = ws["c"], ws["dws"]
+    init = mcp_rpc(c, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                     "clientInfo": {"name": "test", "version": "0"}})
+    assert "worktree" in init["instructions"], "las instrucciones de uso viajan con el servidor"
+    tools = {t["name"] for t in mcp_rpc(c, "tools/list")["tools"]}
+    assert {"devws_status", "devws_create_workspace", "devws_start", "devws_stop",
+            "devws_remove_workspace"} <= tools
+
+    err, st = mcp_tool(c, "devws_status")
+    assert not err, st
+    assert {r["name"] for r in st["repos"]} == {"api", "worker", "web", "lib"}
+
+    err, w = mcp_tool(c, "devws_create_workspace", name="mcp1", repos={"api": "feat-a"}, services=["api"])
+    assert not err and w["status"] == "ok", w
+    assert w["dirs"] == {"api": str(dws / "worktrees" / "mcp1__api")}
+    assert (dws / "worktrees" / "mcp1__api" / "BRANCH").read_text() == "feat-a"
+
+    err, w = mcp_tool(c, "devws_create_workspace", name="mcp1", repos={"worker": "mcp-nueva"},
+                      bases={"worker": "feat-a"})
+    assert not err and w["status"] == "ok", w
+    assert w["repos"] == {"api": "feat-a", "worker": "mcp-nueva"}, "se anade al espacio existente"
+    assert (dws / "worktrees" / "mcp1__worker" / "BRANCH").read_text() == "feat-a"
+
+    err, msg = mcp_tool(c, "devws_create_workspace", name="mcp1", repos={"nope": "main"})
+    assert err and "repo desconocido" in msg
+
+    err, w = mcp_tool(c, "devws_start", name="mcp1")
+    assert not err and w["status"] == "ok" and w["active"], w
+    assert w["services"] == [{"name": "api", "port": ws["ports"]["api"], "status": "up"}]
+    assert fetch(ws["ports"]["api"]) == w["dirs"]["api"], "corre desde el worktree"
+    err, w = mcp_tool(c, "devws_stop", name="mcp1")
+    assert not err and not w["active"] and w["services"][0]["status"] == "down", w
+
+    (dws / "worktrees" / "mcp1__api" / "sucio.txt").write_text("x")
+    err, msg = mcp_tool(c, "devws_remove_workspace", name="mcp1")
+    assert err and "sin commitear" in msg
+    err, r = mcp_tool(c, "devws_remove_workspace", name="mcp1", force=True)
+    assert not err and r["ok"], r
+    assert not (dws / "worktrees" / "mcp1__api").exists()
+    assert "mcp1" not in c.get("/api/profiles")

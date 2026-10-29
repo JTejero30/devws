@@ -9,13 +9,15 @@ import subprocess
 import threading
 import time
 import tomllib
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 import psutil
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent
@@ -30,7 +32,16 @@ WEB_PORT = CONFIG.get("meta", {}).get("web_port", 5000)
 NAME_RE = r"[A-Za-z0-9._-]+"
 
 _lock = threading.RLock()
-app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    # el MCP (al final del fichero) necesita su gestor de sesiones vivo
+    async with mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -1267,6 +1278,161 @@ def api_wt_remove(name: str, force: bool = False):
     return {"ok": True, "errors": errs}
 
 
+# --- MCP: devws como herramientas para un agente (Copilot, Claude...) ---------
+# Mismo proceso y mismas funciones que la UI, en http://127.0.0.1:{web_port}/mcp.
+# Las herramientas esperan a que acabe el trabajo en segundo plano y devuelven
+# el resultado (con las rutas de los worktrees), asi el agente no tiene que sondear.
+
+MCP_INSTRUCTIONS = """\
+devws gestiona un workspace multi-repo: ramas, worktrees y servicios locales.
+Un "espacio" es un perfil: in-place (los repos originales) o worktree (una copia
+de trabajo por repo en worktrees/{espacio}__{repo}, con sus dependencias).
+
+Cuando usarlo:
+- Empieza llamando a devws_status para ver repos, ramas y lo que esta arrancado.
+- Si la tarea toca 2 o mas repos, o es una feature/rama nueva que no debe pisar
+  lo que hay en los repos originales, propon un espacio worktree (nombre corto,
+  repos y rama de cada uno; base si la rama es nueva), pide confirmacion al
+  usuario y llama a devws_create_workspace.
+- Un cambio pequeno en un solo repo y en su rama actual se hace en el sitio, sin worktree.
+
+Reglas:
+- Tras crear un espacio, edita SOLO en las rutas que devuelve (dirs), nunca en
+  los repos originales. Los repos que no estan en el espacio no se tocan.
+- Si a mitad de tarea hace falta otro repo, llama otra vez a
+  devws_create_workspace con el mismo nombre y solo ese repo: se anade.
+- Arrancar un espacio para otro que este corriendo (force) y borrar un espacio
+  (devws_remove_workspace) solo con confirmacion explicita del usuario.
+- Commits y push los hace el agente con git dentro de cada worktree, como siempre.
+"""
+
+mcp = MCPServer("devws", instructions=MCP_INSTRUCTIONS)
+
+
+def tool_call(fn, *args, **kwargs):
+    """Errores de la API (HTTPException) como error de herramienta legible."""
+    try:
+        return fn(*args, **kwargs)
+    except HTTPException as e:
+        raise ToolError(str(e.detail))
+
+
+def wait_job_done(profile: str, timeout: float = 1800) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = load_state().get("jobs", {}).get(profile) or {}
+        if job.get("status") != "running":
+            break
+        time.sleep(1)
+    else:
+        raise ToolError(f"{profile}: sigue trabajando tras {timeout:.0f}s; mira devws_status")
+    out = {"status": job.get("status"), "error": job.get("error")}
+    if job.get("status") == "error":
+        f = job_log(profile)
+        out["log"] = f.read_text(errors="replace").splitlines()[-25:] if f.exists() else []
+    return out
+
+
+def space_info(name: str) -> dict:
+    prof = load_profile(name) or {}
+    state = load_state()
+    is_wt = bool(prof.get("worktree"))
+    svc_ids = [f"{name}/{s}" if is_wt else s for s in profile_services(prof)]
+    conns = tcp_conns()
+    known = {r["name"] for r in repos()}
+    return {
+        "name": name,
+        "worktree": is_wt,
+        "repos": prof.get("repos", {}),
+        "dirs": {r: str(wt_dir_for(name, r) if is_wt else repo_path(r))
+                 for r in prof.get("repos", {}) if r in known},
+        "active": state.get("active_profile") == name,
+        "services": [{k: st[k] for k in ("name", "port", "status")}
+                     for st in (service_status(i, service(i.split("/")[-1]), state, conns) for i in svc_ids)],
+    }
+
+
+@mcp.tool()
+def devws_status() -> dict:
+    """Estado del workspace: repos (ruta, rama actual, cambios sin commitear),
+    espacios (perfiles) con sus rutas, cual esta arrancado y trabajos en curso."""
+    state = load_state()
+    return {
+        "workspace_root": str(WORKSPACE_ROOT),
+        "repos": [{"name": r["name"], "path": str(repo_path(r["name"])), "kind": r.get("kind"),
+                   "current": st.get("current"), "dirty": st.get("dirty"), "error": st.get("error")}
+                  for r, st in zip(repos(), api_repos())],
+        "services": [{"name": s["name"], "repo": s["repo"], "port": s["port"]} for s in services()],
+        "active_profile": state.get("active_profile"),
+        "spaces": [space_info(n) for n in api_profiles_list()],
+        "jobs": {p: j for p, j in state.get("jobs", {}).items() if j.get("status") == "running"},
+    }
+
+
+@mcp.tool()
+def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, str] | None = None,
+                           services: list[str] | None = None, start: bool = False) -> dict:
+    """Crea (o amplia, si ya existe) un espacio worktree y deja los worktrees
+    listos con dependencias. Devuelve en `dirs` la ruta de cada worktree: edita ahi.
+
+    name: nombre corto del espacio (letras, numeros, . _ -), p. ej. la feature.
+    repos: repo -> rama. Si la rama no existe se crea desde bases[repo] o desde
+      la rama por defecto de origin.
+    services: servicios del espacio en orden de arranque (vacio = todos).
+    start: arrancar tambien los servicios (para el espacio que este corriendo).
+    """
+    old = load_profile(name)
+    if old is not None and not old.get("worktree"):
+        raise ToolError(f"{name} es un perfil in-place; usa otro nombre")
+    for r in repos:
+        tool_call(repo_path, r)
+    if old is None:
+        req = ProfileIn(name=name, repos=repos, worktree=True, services=services or [], bases=bases or {})
+        tool_call(api_profiles_save, req)
+    else:
+        req = profile_in(name, old)
+        req.repos = {**req.repos, **repos}
+        req.bases = {**req.bases, **(bases or {})}
+        if services is not None:
+            req.services = services
+        tool_call(api_profiles_update, req)
+    if start:
+        tool_call(api_profile_start, name, force=True)
+    else:
+        tool_call(start_job, name, "prepare")
+    return {**wait_job_done(name), **space_info(name)}
+
+
+@mcp.tool()
+def devws_start(name: str, force: bool = False) -> dict:
+    """Arranca un espacio (prepara/checkout + servicios). Si hay otro arrancado
+    falla salvo force=true, que lo para antes: pide confirmacion al usuario."""
+    tool_call(api_profile_start, name, force=force)
+    return {**wait_job_done(name), **space_info(name)}
+
+
+@mcp.tool()
+def devws_stop(name: str) -> dict:
+    """Para los servicios de un espacio."""
+    tool_call(api_profile_stop, name)
+    return {**wait_job_done(name), **space_info(name)}
+
+
+@mcp.tool()
+def devws_remove_workspace(name: str, force: bool = False) -> dict:
+    """Borra los worktrees de un espacio y su perfil (las ramas y commits se
+    conservan). Con cambios sin commitear falla salvo force=true, que los pierde:
+    solo con confirmacion explicita del usuario."""
+    prof = tool_call(_profile_or_404, name)
+    if not prof.get("worktree"):
+        raise ToolError(f"{name} es un perfil in-place: no tiene worktrees que borrar")
+    errors = []
+    if name in wt_profiles():
+        errors = tool_call(api_wt_remove, name, force=force)["errors"]
+    api_profiles_delete(name)
+    return {"ok": not errors, "errors": errors}
+
+
 @app.get("/")
 def index():
     return FileResponse(ROOT / "static" / "index.html")
@@ -1274,6 +1440,8 @@ def index():
 
 reset_interrupted_jobs()
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+# al final: atiende /mcp y lo que no haya resuelto ninguna ruta de arriba
+app.mount("/", mcp.streamable_http_app(stateless_http=True, json_response=True))
 
 
 if __name__ == "__main__":
