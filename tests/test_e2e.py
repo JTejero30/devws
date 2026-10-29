@@ -265,14 +265,18 @@ def wt_info(c: Client, prof: str) -> dict | None:
     return c.get("/api/state")["worktrees"].get(prof)
 
 
+def wait_job(c: Client, prof: str, expect: str = "ok") -> dict:
+    """Espera a que acabe el trabajo del perfil; devuelve job + info de worktrees."""
+    j = wait_for(lambda: (j := c.get("/api/state")["jobs"].get(prof)) and j["status"] != "running" and j,
+                 180, f"trabajo de {prof}")
+    assert j["status"] == expect, (j, c.get(f"/api/logs/{prof}--actividad")["lines"][-20:])
+    return {**(wt_info(c, prof) or {}), **j}
+
+
 def prepare(c: Client, prof: str, expect: str = "ok") -> dict:
-    """apply del perfil worktree y espera a que la preparacion termine."""
-    r = c.post(f"/api/profiles/{prof}/apply")
-    assert r["worktree"], r
-    w = wait_for(lambda: (w := wt_info(c, prof)) and w["status"] != "running" and w,
-                 180, f"preparacion de {prof}")
-    assert w["status"] == expect, (w, c.get(f"/api/logs/{prof}--prep")["lines"][-20:])
-    return w
+    """Prepara los worktrees del perfil (sin arrancar servicios) y espera."""
+    c.post(f"/api/profiles/{prof}/prepare")
+    return wait_job(c, prof, expect)
 
 
 def test_worktree_ciclo(ws):
@@ -321,13 +325,16 @@ def test_perfil_in_place_arranca_en_orden_del_perfil(ws):
     c = ws["c"]
     c.post("/api/profiles", {"name": "orden", "repos": {"api": "main", "worker": "main"},
                              "services": ["api", "worker"], "worktree": False})
-    r = c.post("/api/profiles/orden/apply")
-    assert [n for n, _ in r["services"]] == ["api", "worker"], r
-    assert all(u["ok"] for _, u in r["services"]), r
+    c.post("/api/profiles/orden/start")
+    wait_job(c, "orden")
+    log = " | ".join(c.get("/api/logs/orden--actividad")["lines"])
+    assert log.index("arrancando api (1/2)") < log.index("arrancando worker (2/2)"), log
     assert c.get("/api/state")["active_profile"] == "orden"
-    for s in ("api", "worker"):
-        c.post(f"/api/services/{s}/down")
-    assert c.get("/api/state")["active_profile"] is None
+    assert svc(c, "api")["status"] == "up" and svc(c, "worker")["status"] == "up"
+    c.post("/api/profiles/orden/stop")
+    wait_job(c, "orden")
+    st = c.get("/api/state")
+    assert st["active_profile"] is None and svc(c, "api")["status"] == "down"
     c.delete("/api/profiles/orden")
 
 
@@ -433,8 +440,8 @@ def test_adoptar_huerfanos_en_un_perfil_existente(ws):
     r = c.post("/api/worktrees/orphans/adop__worker/adopt")
     assert r["profile"] == "adop"
     assert c.get("/api/profiles/adop")["repos"] == {"api": "feat-a", "worker": "feat-w"}
-    w = wait_for(lambda: (w := wt_info(c, "adop")) and w["status"] != "running" and w, 120, "adopcion")
-    assert w["status"] == "ok" and set(w["repos"]) == {"api", "worker"}
+    w = wait_job(c, "adop")
+    assert set(w["repos"]) == {"api", "worker"}
     assert c.get("/api/worktrees/orphans") == []
     c.delete("/api/worktrees/adop")
     c.delete("/api/profiles/adop")
@@ -445,11 +452,53 @@ def test_preparacion_interrumpida_por_reinicio_permite_reintentar(ws):
     c.post("/api/profiles", {"name": "reini", "repos": {"worker": "feat-a"}, "worktree": True})
     state_file = dws / "state.json"
     st = json.loads(state_file.read_text())
-    st.setdefault("prep", {})["reini"] = {"status": "running", "step": "uv sync"}
+    st.setdefault("jobs", {})["reini"] = {"action": "start", "status": "running", "step": "uv sync"}
     state_file.write_text(json.dumps(st))
     ws["restart"]()
-    w = wt_info(c, "reini")
-    assert w["status"] == "error" and "reintentar" in w["error"]
+    j = c.get("/api/state")["jobs"]["reini"]
+    assert j["status"] == "error" and "interrumpido" in j["error"]
     prepare(c, "reini")
     c.delete("/api/worktrees/reini")
     c.delete("/api/profiles/reini")
+
+
+def test_arrancar_parar_y_cambiar_de_espacio(ws):
+    c, ports, dws, root = ws["c"], ws["ports"], ws["dws"], ws["root"]
+    c.post("/api/profiles", {"name": "ea", "repos": {"api": "feat-a"}, "services": ["worker", "api"], "worktree": True})
+    c.post("/api/profiles", {"name": "eb", "repos": {"worker": "main"}, "services": ["worker"], "worktree": False})
+    # arrancar un perfil worktree sin preparar: crea worktrees, deps y servicios
+    c.post("/api/profiles/ea/start")
+    wait_job(c, "ea")
+    st = c.get("/api/state")
+    assert st["active_profile"] == "ea"
+    assert fetch(ports["api"]) == str(dws / "worktrees" / "ea__api")
+    assert fetch(ports["worker"]) == str(root / "commons" / "worker"), "worker no esta en el perfil: original"
+    # otro espacio arrancado: 409 sin force, con force cambia de espacio
+    status, out = c.post("/api/profiles/eb/start", ok=False)
+    assert status == 409 and "esta arrancado ea" in out["detail"]
+    c.post("/api/profiles/eb/start?force=true")
+    wait_job(c, "eb")
+    st = c.get("/api/state")
+    assert st["active_profile"] == "eb"
+    assert fetch(ports["api"]) is None, "el espacio anterior se paro"
+    assert svc(c, "worker")["status"] == "up"
+    # un trabajo a la vez
+    c.post("/api/profiles/eb/stop")
+    status, out = c.post("/api/profiles/ea/start?force=true", ok=False)
+    assert status == 409 and "espera" in out["detail"], out
+    wait_job(c, "eb")
+    assert c.get("/api/state")["active_profile"] is None
+    assert all(s["status"] == "down" for s in c.get("/api/state")["services"])
+    c.delete("/api/worktrees/ea")
+    for p in ("ea", "eb"):
+        c.delete(f"/api/profiles/{p}")
+
+
+def test_error_al_arrancar_se_ve_en_el_trabajo(ws):
+    c = ws["c"]
+    c.post("/api/profiles", {"name": "roto", "repos": {"api": "main"}, "worktree": True})
+    j = (c.post("/api/profiles/roto/start"), wait_job(c, "roto", expect="error"))[1]
+    assert "ya esta abierta" in j["error"]
+    assert c.get("/api/state")["active_profile"] is None
+    assert all(s["status"] == "down" for s in c.get("/api/state")["services"]), "no arranca servicios si falla"
+    c.delete("/api/profiles/roto")

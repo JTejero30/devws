@@ -750,7 +750,8 @@ def api_state():
     return {"services": [service_status(i, service(i.split("/")[-1]), state, conns)
                          for i in service_ids(state, wts)],
             "active_profile": state.get("active_profile"),
-            "worktrees": wts}
+            "worktrees": wts,
+            "jobs": state.get("jobs", {})}
 
 
 @app.get("/api/logs/tail")
@@ -858,19 +859,21 @@ def api_profiles_delete(name: str):
     with state_tx() as st:
         if st.get("active_profile") == name:
             st["active_profile"] = None
-        st.get("prep", {}).pop(name, None)
+        st.get("jobs", {}).pop(name, None)
     return {"ok": True}
 
 
-# --- perfiles worktree -------------------------------------------------------
-# Fuente de verdad: el perfil (profiles/*.toml, worktree = true) + lo que hay en
-# disco (worktrees/{perfil}__{repo}). state.json solo guarda el progreso de la
-# preparacion en state["prep"][perfil] = {status: running|ok|error, step, error}.
+# --- espacios de trabajo: arrancar / parar perfiles --------------------------
+# Un perfil es un espacio de trabajo: in-place (checkout en los repos originales)
+# o worktree (worktrees/{perfil}__{repo}; los repos no incluidos corren desde el
+# original). Solo uno arrancado a la vez. Arrancar y parar son trabajos en
+# segundo plano: progreso en state["jobs"][perfil] = {action, status, step, error}
+# y salida en logs/{perfil}--actividad.log. De los worktrees, la fuente de verdad
+# es el perfil (profiles/*.toml) + lo que hay en disco.
 
 
 def wt_profiles() -> dict[str, dict]:
-    """Perfiles worktree con algun worktree en disco (o preparandose)."""
-    prep = load_state().get("prep", {})
+    """Perfiles worktree con algun worktree en disco."""
     out = {}
     if not PROFILES_DIR.exists():
         return out
@@ -882,17 +885,13 @@ def wt_profiles() -> dict[str, dict]:
         if not prof.get("worktree"):
             continue
         on_disk = {r: b for r, b in prof.get("repos", {}).items() if wt_dir_for(f.stem, r).is_dir()}
-        pr = prep.get(f.stem, {})
-        if not on_disk and pr.get("status") not in ("running", "error"):
-            continue
-        out[f.stem] = {"repos": on_disk, "services": profile_services(prof),
-                       "status": pr.get("status", "ok"), "step": pr.get("step"),
-                       "error": pr.get("error"), "ready": pr.get("status", "ok") == "ok"}
+        if on_disk:
+            out[f.stem] = {"repos": on_disk, "services": profile_services(prof)}
     return out
 
 
 def wt_pending(profile: str) -> list[str]:
-    """Repos del perfil cuyo worktree falta o esta en otra rama: hay que sincronizar."""
+    """Repos del perfil cuyo worktree falta o esta en otra rama (se aplica al arrancar)."""
     out = []
     for r, b in (load_profile(profile) or {}).get("repos", {}).items():
         d = wt_dir_for(profile, r)
@@ -912,73 +911,206 @@ def wt_dirty(d: Path) -> int:
         return 0
 
 
-def _set_prep(profile: str, **info) -> None:
+def space_ids(profile: str, prof: dict, state: dict) -> list[str]:
+    """Ids de servicio corriendo que pertenecen al espacio del perfil."""
+    alive = [sid for sid, e in state["services"].items() if e and pid_alive(e["pid"])]
+    if prof.get("worktree"):
+        return [sid for sid in alive if sid.startswith(f"{profile}/")]
+    if state.get("active_profile") == profile:
+        return [sid for sid in alive if "/" not in sid]
+    return []
+
+
+def job_log(profile: str) -> Path:
+    return log_file_for(f"{profile}--actividad")
+
+
+def _set_job(profile: str, **info) -> None:
     with state_tx() as st:
-        st.setdefault("prep", {})[profile] = info
+        st.setdefault("jobs", {})[profile] = info
 
 
-def wt_sync(profile: str) -> None:
-    """Crea o actualiza los worktrees del perfil e instala dependencias. Corre
-    en segundo plano: progreso en state["prep"], salida en logs/{perfil}--prep.log.
-    Un repo que falla no para al resto; el perfil acaba en error si alguno falla."""
-    prof = load_profile(profile) or {}
-    bases = prof.get("bases", {})
-    LOGS_DIR.mkdir(exist_ok=True)
-    log = log_file_for(f"{profile}--prep")
-    log.write_text(f"=== preparar {profile} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+class Job:
+    """Contexto de un trabajo: anota pasos en state y en el log de actividad."""
 
-    def note(msg: str) -> None:
-        with open(log, "a") as fh:
+    def __init__(self, profile: str, action: str):
+        self.profile, self.action = profile, action
+        LOGS_DIR.mkdir(exist_ok=True)
+        self.log = job_log(profile)
+        self.log.write_text(f"=== {action} {profile} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+
+    def step(self, msg: str) -> None:
+        _set_job(self.profile, action=self.action, status="running", step=msg)
+        with open(self.log, "a") as fh:
             fh.write(f"\n--- {time.strftime('%H:%M:%S')} {msg}\n")
 
-    def run(cmd: list[str], cwd: Path, timeout: int) -> int:
-        with open(log, "ab") as fh:
+    def run(self, cmd: list[str], cwd: Path, timeout: int) -> int:
+        with open(self.log, "ab") as fh:
             return subprocess.run([shutil.which(cmd[0]) or cmd[0], *cmd[1:]], cwd=cwd,
                                   stdout=fh, stderr=subprocess.STDOUT, timeout=timeout).returncode
 
-    errors = []
+
+def deps_install(job: Job, rname: str, d: Path) -> None:
+    kind = next((r["kind"] for r in repos() if r["name"] == rname), "python")
+    cmd = ["npm", "install", "--no-audit", "--no-fund"] if kind == "npm" else ["uv", "sync"]
+    job.step(f"{rname}: instalando dependencias ({' '.join(cmd[:2])})")
+    rc = job.run(cmd, d, 1800 if kind == "npm" else 900)
+    if rc != 0 and kind != "npm":
+        # registry de paquetes caido: reintentar con la cache local (wheels de otros repos)
+        job.step(f"{rname}: uv sync --offline")
+        rc = job.run(["uv", "sync", "--offline"], d, 900)
+    if rc != 0:
+        raise RuntimeError(f"{rname}: fallo la instalacion de dependencias (codigo {rc})")
+
+
+def deps_missing(rname: str, d: Path) -> bool:
+    kind = next((r["kind"] for r in repos() if r["name"] == rname), "python")
+    return not (d / ("node_modules" if kind == "npm" else ".venv")).exists()
+
+
+def job_prepare(job: Job, prof: dict) -> None:
+    """Worktrees en su rama y con dependencias (solo reinstala si cambian)."""
+    bases = prof.get("bases", {})
     for rname, branch in prof.get("repos", {}).items():
+        d = wt_dir_for(job.profile, rname)
         try:
-            _set_prep(profile, status="running", step=f"{rname}: worktree en {branch}")
-            note(f"{rname}: worktree en {branch}")
-            d = wt_ensure(rname, branch, profile, bases.get(rname))
-            kind = next((r["kind"] for r in repos() if r["name"] == rname), "python")
-            cmd = ["npm", "install", "--no-audit", "--no-fund"] if kind == "npm" else ["uv", "sync"]
-            _set_prep(profile, status="running", step=f"{rname}: {' '.join(cmd[:2])}")
-            note(f"{rname}: {' '.join(cmd)}")
-            rc = run(cmd, d, 1800 if kind == "npm" else 900)
-            if rc != 0 and kind != "npm":
-                # registry de paquetes caido: reintentar con la cache local (wheels de otros repos)
-                note(f"{rname}: uv sync --offline")
-                rc = run(["uv", "sync", "--offline"], d, 900)
-            if rc != 0:
-                raise RuntimeError(f"instalacion de dependencias fallida (codigo {rc})")
-        except (HTTPException, RuntimeError, OSError, subprocess.TimeoutExpired) as e:
-            msg = str(e.detail) if isinstance(e, HTTPException) else str(e)
-            note(f"ERROR {rname}: {msg}")
-            errors.append(f"{rname}: {msg}")
-    note("terminado con errores" if errors else "listo")
-    if errors:
-        _set_prep(profile, status="error", error="; ".join(errors))
+            before = git(d, "branch", "--show-current", timeout=5).strip() if d.is_dir() else None
+        except RuntimeError:
+            before = None
+        job.step(f"{rname}: worktree en {branch}" if before is None else f"{rname}: comprobando worktree")
+        wt_ensure(rname, branch, job.profile, bases.get(rname))
+        if before != branch or deps_missing(rname, d):
+            deps_install(job, rname, d)
+
+
+def job_checkout(job: Job, prof: dict) -> None:
+    """In-place: checkout en los repos originales (+ uv sync si cambia una libreria)."""
+    bases = prof.get("bases", {})
+    libs = {l["name"]: l.get("consumers", []) for l in CONFIG.get("libraries", [])}
+    for rname, branch in prof.get("repos", {}).items():
+        before = git(repo_path(rname), "branch", "--show-current").strip()
+        job.step(f"{rname}: checkout {branch}")
+        do_checkout(rname, branch, bases.get(rname))
+        if rname in libs and before != branch:
+            for target in [rname, *libs[rname]]:
+                job.step(f"{target}: uv sync (cambio la libreria {rname})")
+                job.run(["uv", "sync"], repo_path(target), 600)
+
+
+def job_start(job: Job, prof: dict, services_too: bool = True) -> list[str]:
+    is_wt = bool(prof.get("worktree"))
+    if services_too:
+        # regla de oro: un solo espacio arrancado; se para todo lo que corra
+        running = [sid for sid, e in load_state()["services"].items() if e and pid_alive(e["pid"])]
+        for sid in reversed(running):
+            job.step(f"parando {sid} (otro espacio)")
+            api_down(sid)
+    if is_wt:
+        job_prepare(job, prof)
     else:
-        _set_prep(profile, status="ok")
-
-
-def wt_start_sync(profile: str) -> None:
+        job_checkout(job, prof)
+    if not services_too:
+        return []
+    errors = []
+    svcs = profile_services(prof)
+    for i, s in enumerate(svcs, 1):
+        job.step(f"arrancando {s} ({i}/{len(svcs)})")
+        r = api_up(f"{job.profile}/{s}" if is_wt else s, force=True)
+        if not r.get("ok") or r.get("warn"):
+            errors.append(f"{s}: {r.get('warn') or r.get('msg')}")
     with state_tx() as st:
-        if st.get("prep", {}).get(profile, {}).get("status") == "running":
-            raise HTTPException(409, f"{profile}: ya se esta preparando")
-        st.setdefault("prep", {})[profile] = {"status": "running", "step": "empezando"}
-    threading.Thread(target=wt_sync, args=(profile,), daemon=True).start()
+        st["active_profile"] = job.profile
+    return errors
 
 
-def reset_interrupted_prep() -> None:
-    """Una preparacion 'running' al arrancar el servidor murio con el anterior."""
+def job_stop(job: Job, prof: dict) -> None:
+    state = load_state()
+    ids = space_ids(job.profile, prof, state)
+    order = profile_services(prof)
+    ids.sort(key=lambda sid: -order.index(sid.split("/")[-1]) if sid.split("/")[-1] in order else 0)
+    for sid in ids:
+        job.step(f"parando {sid.split('/')[-1]}")
+        api_down(sid)
     with state_tx() as st:
-        for info in st.get("prep", {}).values():
+        if st.get("active_profile") == job.profile:
+            st["active_profile"] = None
+
+
+def run_job(profile: str, action: str) -> None:
+    job = Job(profile, action)
+    prof = load_profile(profile) or {}
+    errors = []
+    try:
+        if action == "stop":
+            job_stop(job, prof)
+        else:
+            errors = job_start(job, prof, services_too=(action == "start"))
+    except Exception as e:  # hilo en segundo plano: el error tiene que llegar a la UI
+        errors.append(str(e.detail) if isinstance(e, HTTPException) else str(e))
+    with open(job.log, "a") as fh:
+        fh.write("\n=== " + ("ERROR: " + "; ".join(errors) if errors else "listo") + " ===\n")
+    _set_job(profile, action=action, status="error" if errors else "ok",
+             error="; ".join(errors) or None)
+
+
+def start_job(profile: str, action: str) -> None:
+    with state_tx() as st:
+        busy = [p for p, j in st.get("jobs", {}).items() if j.get("status") == "running"]
+        if busy:
+            raise HTTPException(409, f"espera: {busy[0]} todavia esta trabajando")
+        st.setdefault("jobs", {})[profile] = {"action": action, "status": "running",
+                                              "step": "parando…" if action == "stop" else "empezando…"}
+    threading.Thread(target=run_job, args=(profile, action), daemon=True).start()
+
+
+def reset_interrupted_jobs() -> None:
+    """Un trabajo 'running' al arrancar el servidor murio con el anterior."""
+    with state_tx() as st:
+        for info in st.get("jobs", {}).values():
             if info.get("status") == "running":
                 info.update(status="error", step=None,
-                            error="interrumpida al reiniciar devws; pulsa reintentar")
+                            error="interrumpido al reiniciar devws; vuelve a intentarlo")
+
+
+def _profile_or_404(name: str) -> dict:
+    prof = load_profile(name)
+    if prof is None:
+        raise HTTPException(404, f"perfil no existe: {name}")
+    for r in prof.get("repos", {}):
+        repo_path(r)
+    return prof
+
+
+@app.post("/api/profiles/{name}/start")
+def api_profile_start(name: str, force: bool = False):
+    """Arranca el espacio del perfil (prepara/checkout + servicios). Si hay otro
+    espacio arrancado responde 409 salvo force=true, que lo para antes."""
+    prof = _profile_or_404(name)
+    state = load_state()
+    mine = set(space_ids(name, prof, state))
+    others = [sid for sid, e in state["services"].items()
+              if e and pid_alive(e["pid"]) and sid not in mine]
+    if others and not force:
+        owner = state.get("active_profile") or others[0].partition("/")[0]
+        raise HTTPException(409, f"esta arrancado {owner}: se parara para arrancar {name}")
+    start_job(name, "start")
+    return {"ok": True}
+
+
+@app.post("/api/profiles/{name}/stop")
+def api_profile_stop(name: str):
+    _profile_or_404(name)
+    start_job(name, "stop")
+    return {"ok": True}
+
+
+@app.post("/api/profiles/{name}/prepare")
+def api_profile_prepare(name: str):
+    """Solo worktrees + dependencias, sin arrancar servicios."""
+    if not _profile_or_404(name).get("worktree"):
+        raise HTTPException(400, f"{name} no es un perfil worktree")
+    start_job(name, "prepare")
+    return {"ok": True}
 
 
 def orphan_worktrees() -> list[dict]:
@@ -1030,7 +1162,7 @@ def api_wt_adopt(dir: str):
         req.repos = {**req.repos, rname: branch}
     PROFILES_DIR.mkdir(exist_ok=True)
     profile_file(prof).write_text(profile_body(req, old.get("created_at") if old else None))
-    wt_start_sync(prof)
+    start_job(prof, "prepare")
     return {"ok": True, "profile": prof,
             "msg": f"{rname} adoptado en el perfil {prof}; comprobando deps en segundo plano"}
 
@@ -1063,38 +1195,6 @@ def api_wt_orphan_remove(dir: str, force: bool = False):
     return {"ok": True}
 
 
-@app.post("/api/profiles/{name}/apply")
-def api_profiles_apply(name: str):
-    prof = load_profile(name)
-    if prof is None:
-        raise HTTPException(404, f"perfil no existe: {name}")
-    for r in prof.get("repos", {}):
-        repo_path(r)
-    if prof.get("worktree"):
-        # crear / sincronizar: ramas cambiadas, repos nuevos, deps; en segundo plano
-        wt_start_sync(name)
-        return {"checkout": [], "services": [], "worktree": True,
-                "msg": "preparando worktrees en segundo plano (ver log de preparacion)"}
-    state = load_state()
-    other = state.get("active_profile")
-    running = [n for n, e in state["services"].items() if e and pid_alive(e["pid"])]
-    if other and other != name and running:
-        raise HTTPException(409, f"perfil activo: {other} (corriendo: {', '.join(running)}). "
-                            f"Baja los servicios antes de cargar otro perfil")
-    if other == name and running:
-        # ya es el perfil activo: idempotente, no relanza checkouts/servicios
-        return {"checkout": [], "services": [], "worktree": False,
-                "msg": f"perfil {name} ya activo (corriendo: {', '.join(running)})"}
-    bases = prof.get("bases", {})
-    results = api_checkout(CheckoutReq(items=[CheckoutItem(repo=r, branch=b, base=bases.get(r))
-                                              for r, b in prof.get("repos", {}).items()]))
-    # orden de arranque = orden del perfil (el formulario lo promete asi)
-    ups = [(s, api_up(s, force=True)) for s in profile_services(prof)]
-    with state_tx() as st:
-        st["active_profile"] = name
-    return {"checkout": results, "services": ups, "worktree": False}
-
-
 @app.post("/api/services/wt/{profile}/{name}/up")
 def api_wt_up(profile: str, name: str, force: bool = False):
     return api_up(f"{profile}/{name}", force=force)
@@ -1114,6 +1214,8 @@ def wt_down_profile(profile: str) -> list:
     with state_tx() as st:
         gone = [(sid, st["services"].pop(sid)) for sid in list(st["services"])
                 if sid.startswith(f"{profile}/")]
+        if gone and st.get("active_profile") == profile:
+            st["active_profile"] = None
     out = []
     for sid, entry in gone:
         if entry:
@@ -1155,15 +1257,13 @@ def api_wt_remove(name: str, force: bool = False):
     w = wt_profiles().get(name)
     if not w:
         raise HTTPException(404, f"worktree no existe: {name}")
-    if w["status"] == "running":
-        raise HTTPException(409, f"{name}: se esta preparando; espera a que termine")
+    if load_state().get("jobs", {}).get(name, {}).get("status") == "running":
+        raise HTTPException(409, f"{name}: esta trabajando; espera a que termine")
     dirs = [(r, wt_dir_for(name, r)) for r in w["repos"]]
     if any(wt_dirty(d) for _, d in dirs) and not force:
         wt_remove_dirs(dirs, force=False)  # lanza el 409 con el detalle
     wt_down_profile(name)
     errs = wt_remove_dirs(dirs, force=True)
-    with state_tx() as st:
-        st.get("prep", {}).pop(name, None)
     return {"ok": True, "errors": errs}
 
 
@@ -1172,7 +1272,7 @@ def index():
     return FileResponse(ROOT / "static" / "index.html")
 
 
-reset_interrupted_prep()
+reset_interrupted_jobs()
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
