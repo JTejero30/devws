@@ -7,3 +7,7 @@ uv.lock
 .DS_Store
 worktrees/
 workspaces/
+# config local de cada maquina (plantilla versionada: config.example.toml)
+config.toml
+*.toml.tmp
+profiles/

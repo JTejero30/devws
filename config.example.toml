@@ -1,0 +1,69 @@
+# Plantilla: copiar a config.toml (no versionado) y ajustar a la maquina.
+# Declaracion de repos y servicios para el front local de desarrollo.
+# Los paths son relativos a la raiz del workspace (~/proyectos).
+
+[meta]
+web_port = 5000
+
+[[repos]]
+name = "api-gateway"
+path = "api-gateway"
+kind = "python"
+
+[[repos]]
+name = "search-service"
+path = "search-service"
+kind = "python"
+
+[[repos]]
+name = "web-portal"
+path = "web-portal"
+kind = "npm"
+
+[[repos]]
+name = "core-lib"
+path = "core-lib"
+kind = "python"
+
+[[repos]]
+name = "db-service"
+path = "../commons/db-service"
+kind = "python"
+
+# Orden de arranque = orden de aparicion aqui.
+[[services]]
+name = "db"
+repo = "db-service"
+port = 5432
+# .venv directo (como el launch.json): "uv run" re-resuelve deps contra el registry de paquetes
+# en cada arranque y cae si el registry no responde; el venv lo puebla wt_prep (uv sync)
+cmd = ["./.venv/bin/python", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "{port}", "--reload"]
+
+[[services]]
+name = "search"
+repo = "search-service"
+port = 8000
+cmd = ["./.venv/bin/python", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "{port}", "--reload"]
+
+[[services]]
+name = "gateway"
+repo = "api-gateway"
+port = 8001
+cmd = ["./.venv/bin/python", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "{port}", "--reload"]
+
+[[services]]
+name = "portal"
+repo = "web-portal"
+port = 4200
+cmd = ["npm", "run", "start", "--", "--port", "{port}"]
+
+# Modelo: SOLO un espacio de trabajo activo a la vez (los servicios del worktree
+# del perfil corren en LOS MISMOS puertos basicos que in-place: :5432/:8000/:8001/:4200).
+# El wiring inter-servicios de un worktree se edita a mano dentro del worktree
+# (p. ej. wiring.toml de api-gateway), igual que en el repo original.
+
+# Repo libreria: no tiene servicio; al checkout hace "uv sync" en este repo
+# y en los repos python que dependen de el (api-gateway, search-service).
+[[libraries]]
+name = "core-lib"
+consumers = ["api-gateway", "search-service"]
