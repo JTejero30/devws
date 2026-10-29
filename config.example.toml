@@ -1,6 +1,7 @@
 # Plantilla: copiar a config.toml (no versionado) y ajustar a la maquina.
 # Declaracion de repos y servicios para el front local de desarrollo.
-# Los paths son relativos a la raiz del workspace (~/proyectos).
+# Paths de repo: absolutos (admiten ~), p. ej. "~/Proyectos/api-gateway". Por
+# compatibilidad, un path relativo se resuelve desde la raiz del workspace.
 
 [meta]
 web_port = 5000

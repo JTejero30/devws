@@ -563,3 +563,15 @@ def test_mcp_crea_amplia_y_borra_un_espacio(ws):
     assert not err and r["ok"], r
     assert not (dws / "worktrees" / "mcp1__api").exists()
     assert "mcp1" not in c.get("/api/profiles")
+
+
+def test_anadir_repo_con_path_absoluto(ws):
+    c, root = ws["c"], ws["root"]
+    st, out = c.post("/api/repos", {"name": "rel", "path": "api"}, ok=False)
+    assert st == 400 and "absoluto" in out["detail"]
+    st, out = c.post("/api/repos", {"name": "nada", "path": str(root / "no-existe")}, ok=False)
+    assert st == 400 and "no hay repo git" in out["detail"]
+    c.post("/api/repos", {"name": "api2", "path": str(root / "api")})
+    assert f'path = "{(root / "api").resolve().as_posix()}"' in (ws["dws"] / "config.toml").read_text()
+    assert {r["name"]: r for r in c.get("/api/repos")}["api2"]["current"] == "main"
+    c.delete("/api/repos/api2")

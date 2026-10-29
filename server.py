@@ -98,7 +98,7 @@ def services() -> list[dict]:
 def repo_path(name: str) -> Path:
     for r in repos():
         if r["name"] == name:
-            return (WORKSPACE_ROOT / r["path"]).resolve()
+            return (WORKSPACE_ROOT / Path(r["path"]).expanduser()).resolve()
     raise HTTPException(404, f"repo desconocido: {name}")
 
 
@@ -256,13 +256,18 @@ def api_repos_add(body: RepoIn):
     kind = body.kind if body.kind in ("python", "npm") else "python"
     if any(r["name"] == name for r in repos()):
         raise HTTPException(409, f"repo ya existe: {name}")
-    d = (WORKSPACE_ROOT / path).resolve()
+    # path absoluto (se admite ~); en config.toml se guarda ya resuelto. Los
+    # relativos que ya hubiera en config.toml siguen valiendo (repo_path)
+    d = Path(path).expanduser()
+    if not d.is_absolute():
+        raise HTTPException(400, f"el path tiene que ser absoluto (p. ej. {Path.home() / 'Proyectos' / 'mi-repo'})")
+    d = d.resolve()
     if not (d / ".git").exists():
-        raise HTTPException(400, f"no hay repo git en {path} (relativo a {WORKSPACE_ROOT})")
+        raise HTTPException(400, f"no hay repo git en {d}")
     with _lock:
         cfg_file = ROOT / "config.toml"
         lines = cfg_file.read_text().splitlines(keepends=True)
-        block = f"[[repos]]\nname = {toml_str(name)}\npath = {toml_str(path)}\nkind = {toml_str(kind)}\n\n"
+        block = f"[[repos]]\nname = {toml_str(name)}\npath = {toml_str(d.as_posix())}\nkind = {toml_str(kind)}\n\n"
         try:
             i = next(j for j, l in enumerate(lines) if l.lstrip().startswith("[[services]]"))
         except StopIteration:

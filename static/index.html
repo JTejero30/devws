@@ -143,7 +143,7 @@ font-size:12px; flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-
 </div>
 <div id="repoForm" style="display:none;margin:8px 0 10px;border:1px solid var(--border);border-radius:6px;padding:8px">
 <div class="row"><label class="name" style="font-weight:400">Nombre</label><input type="text" id="repoName" placeholder="ej: mi-nuevo-repo"></div>
-<div class="row"><label class="name" style="font-weight:400">Path</label><input type="text" id="repoPath" placeholder="relativo al directorio padre de .devws, ej: mi-repo o ../commons/otro" style="width:420px"></div>
+<div class="row"><label class="name" style="font-weight:400">Path</label><input type="text" id="repoPath" placeholder="path absoluto, ej: ~/Proyectos/mi-repo o /Users/yo/Proyectos/commons/otro" style="width:420px"></div>
 <div class="row"><label class="name" style="font-weight:400">Tipo</label><select id="repoKind" style="flex:0 1 110px"><option value="python">python</option><option value="npm">npm</option></select></div>
 <div class="p-actions">
 <button class="primary" onclick="saveRepo()">Añadir</button>
