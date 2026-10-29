@@ -9,5 +9,6 @@ worktrees/
 workspaces/
 # config local de cada maquina (plantilla versionada: config.example.toml)
 config.toml
+config.toml.bak
 *.toml.tmp
 profiles/
