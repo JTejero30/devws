@@ -645,6 +645,10 @@ def _start_service(svc: dict, port: int, killed: list,
     exclude = {os.getpid()}
     logf_path = log_file_for(name)
     cmd = [a.replace("{port}", str(port)) for a in svc["cmd"]]
+    # ejecutable relativo al repo (./.venv/bin/python): en macOS/Linux Popen lo
+    # resuelve contra cwd, en Windows contra el cwd de devws; fijarlo al repo
+    if not Path(cmd[0]).is_absolute() and ("/" in cmd[0] or "\\" in cmd[0]):
+        cmd[0] = str(p / cmd[0])
     for attempt in (1, 2):
         if attempt == 1:
             with open(logf_path, "wb") as f:
