@@ -168,6 +168,8 @@ font-size:12px; flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-
 <div class="hint" style="margin:4px 0">Repos que usan esta librería:</div>
 <div id="libConsumers"></div>
 </div>
+<div class="row"><label class="name" style="font-weight:400">Dependencias</label><input type="text" id="repoInstall" style="width:520px;font-family:ui-monospace,monospace" oninput="this.dataset.touched=1">
+<span class="hint" style="width:100%">Comando que instala las dependencias al preparar un worktree. Vacío = no instala nada.</span></div>
 <div class="p-actions">
 <button class="primary" id="repoSaveBtn" onclick="saveRepo()">Añadir</button>
 <button onclick="closeRepoForm()">Cancelar</button>
@@ -624,6 +626,7 @@ const DEFAULT_CMD = {
 python: "./.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port {port} --reload",
 npm: "npm run start -- --port {port}",
 };
+const DEFAULT_INSTALL = { python: "uv sync", npm: "npm install --no-audit --no-fund" };
 function freePort() {
 const used = new Set(services.map(s => s.port));
 let p = Math.max(7999, ...used) + 1;
@@ -639,10 +642,11 @@ $("#repoLaterOpt").style.display = forRepo ? "none" : "flex";
 $("#repoSaveBtn").textContent = forRepo ? "Guardar arranque" : "Añadir";
 if (r) $("#repoKind").value = r.kind || "python";
 document.querySelector("input[name=repoStartup][value=service]").checked = true;
-for (const id of ["#svcName", "#svcCmd"]) delete $(id).dataset.touched;
+for (const id of ["#svcName", "#svcCmd", "#repoInstall"]) delete $(id).dataset.touched;
 $("#svcName").value = forRepo || "";
 $("#svcPort").value = freePort();
 $("#svcCmd").value = DEFAULT_CMD[$("#repoKind").value];
+$("#repoInstall").value = r ? (r.install || []).join(" ") : DEFAULT_INSTALL[$("#repoKind").value];
 repoStartupChange();
 $("#repoForm").style.display = "block";
 $("#repoForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -651,7 +655,11 @@ $("#repoForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
 function openStartupForm(name) { openRepoForm(name); }
 function closeRepoForm() { $("#repoForm").style.display = "none"; $("#repoName").value = ""; $("#repoPath").value = ""; repoFormFor = null; }
 function repoNameChange() { if (!$("#svcName").dataset.touched) $("#svcName").value = $("#repoName").value.trim(); }
-function repoKindChange() { if (!$("#svcCmd").dataset.touched) $("#svcCmd").value = DEFAULT_CMD[$("#repoKind").value]; }
+function repoKindChange() {
+const kind = $("#repoKind").value;
+if (!$("#svcCmd").dataset.touched) $("#svcCmd").value = DEFAULT_CMD[kind];
+if (!$("#repoInstall").dataset.touched) $("#repoInstall").value = DEFAULT_INSTALL[kind];
+}
 function repoStartupChange() {
 const mode = document.querySelector("input[name=repoStartup]:checked").value;
 $("#repoSvc").style.display = mode === "service" ? "block" : "none";
@@ -665,12 +673,13 @@ $("#libConsumers").innerHTML = cands.length
 }
 function startupBody() {
 const mode = document.querySelector("input[name=repoStartup]:checked").value;
-if (mode === "library") return { library: [...document.querySelectorAll("[data-consumer]:checked")].map(c => c.dataset.consumer) };
-if (mode !== "service") return {};
+const install = $("#repoInstall").value.trim();
+if (mode === "library") return { install, library: [...document.querySelectorAll("[data-consumer]:checked")].map(c => c.dataset.consumer) };
+if (mode !== "service") return { install };
 const name = $("#svcName").value.trim(), port = Number($("#svcPort").value), cmd = $("#svcCmd").value.trim();
 if (!name || !cmd) throw new Error("falta el nombre del servicio o el comando");
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("puerto inválido");
-return { service: { name, port, cmd } };
+return { install, service: { name, port, cmd } };
 }
 async function saveRepo() {
 let startup;

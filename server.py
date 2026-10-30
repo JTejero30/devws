@@ -73,7 +73,7 @@ def save_state(state: dict) -> None:
 
 @contextmanager
 def state_tx():
-    """load â†’ modificar â†’ save bajo _lock, para no pisar cambios de otros hilos.
+    """load ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ modificar ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ save bajo _lock, para no pisar cambios de otros hilos.
     No hacer dentro nada lento (git, kill, esperas de puerto)."""
     with _lock:
         state = load_state()
@@ -143,7 +143,7 @@ def port_pids(port: int, conns: list | None = None) -> list[int]:
 
 def port_server_pids(port: int) -> list[int]:
     """Pids que parecen servidores en el puerto pero sin socket LISTEN (p. ej.
-    CLOSED de un uvicorn zombi): no aceptan conexiones pero sÃ­ bloquean el
+    CLOSED de un uvicorn zombi): no aceptan conexiones pero sÃƒÆ’Ã‚Â­ bloquean el
     bind (address already in use). Ignora conexiones ESTABLISHED y los pids
     propios de devws."""
     return sorted({pid for p, pid, st in tcp_conns()
@@ -217,6 +217,7 @@ def api_repos():
             st = repo_status(r["name"])
             st["kind"] = r["kind"]
             st["startup"] = repo_startup(r["name"])
+            st["install"] = install_cmd(r)
             out.append(st)
         except Exception as e:
             out.append({"name": r["name"], "error": str(e)})
@@ -249,9 +250,41 @@ class ServiceIn(BaseModel):
 
 
 class StartupIn(BaseModel):
-    """Como se arranca un repo: un servicio, o es una libreria (sus consumidores)."""
+    """Como se arranca un repo: un servicio, o es una libreria (sus consumidores),
+    y como se instalan sus dependencias en un worktree (install; [] = nada)."""
     service: ServiceIn | None = None
     library: list[str] | None = None
+    install: list[str] | str | None = None
+
+
+DEFAULT_INSTALL = {"python": ["uv", "sync"], "npm": ["npm", "install", "--no-audit", "--no-fund"]}
+
+
+def install_cmd(repo: dict) -> list[str]:
+    """Instalador de dependencias del repo: el de config.toml o el de su kind."""
+    if "install" in repo:
+        return repo["install"]
+    return DEFAULT_INSTALL.get(repo.get("kind", "python"), DEFAULT_INSTALL["python"])
+
+
+def split_cmd(cmd: list[str] | str, what: str) -> list[str]:
+    try:
+        out = shlex.split(cmd) if isinstance(cmd, str) else cmd
+    except ValueError as e:
+        raise HTTPException(400, f"{what} invalido: {e}")
+    if not all(c.strip() for c in out):
+        raise HTTPException(400, f"{what} con argumentos vacios")
+    return out
+
+
+def install_line(kind: str, install: list[str] | str | None) -> str:
+    """Linea install = [...] para [[repos]]; vacia si es la de su kind."""
+    if install is None:
+        return ""
+    cmd = split_cmd(install, "instalador de dependencias")
+    if cmd == DEFAULT_INSTALL.get(kind):
+        return ""
+    return f"install = [{', '.join(toml_str(c) for c in cmd)}]\n"
 
 
 class RepoIn(StartupIn):
@@ -282,11 +315,8 @@ def startup_block(repo: str, st: StartupIn) -> tuple[str, str]:
         clash = next((x["name"] for x in services() if x["port"] == s.port), None)
         if clash:
             raise HTTPException(409, f"el puerto {s.port} ya lo usa el servicio {clash}")
-        try:
-            cmd = shlex.split(s.cmd) if isinstance(s.cmd, str) else s.cmd
-        except ValueError as e:
-            raise HTTPException(400, f"comando invalido: {e}")
-        if not cmd or not all(c.strip() for c in cmd):
+        cmd = split_cmd(s.cmd, "comando")
+        if not cmd:
             raise HTTPException(400, "falta el comando de arranque")
         return "services", (f"[[services]]\nname = {toml_str(s.name)}\nrepo = {toml_str(repo)}\n"
                             f"port = {s.port}\ncmd = [{', '.join(toml_str(c) for c in cmd)}]\n")
@@ -308,7 +338,7 @@ def config_lines() -> list[str]:
 
 
 def write_config(lines: list[str]) -> None:
-    """Escritura atomica: .tmp â†’ validar con tomllib â†’ replace â†’ recargar CONFIG."""
+    """Escritura atomica: .tmp ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ validar con tomllib ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ replace ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ recargar CONFIG."""
     text = "".join(lines)
     try:
         new = tomllib.loads(text)
@@ -364,6 +394,23 @@ def remove_block(lines: list[str], table: str, name: str) -> bool:
     return False
 
 
+def set_block_line(lines: list[str], table: str, name: str, key: str, line: str) -> None:
+    """Pone `line` (key = ...) en el bloque [[table]] de `name`, sustituyendo la que hubiera."""
+    for s in table_starts(lines, table):
+        e = block_end(lines, s)
+        if tomllib.loads("".join(lines[s + 1:e])).get("name") != name:
+            continue
+        old = next((k for k in range(s + 1, e) if lines[k].split("=")[0].strip() == key), None)
+        if old is not None:
+            lines[old] = line
+        else:
+            if not lines[e - 1].endswith("\n"):
+                lines[e - 1] += "\n"
+            lines.insert(e, line)
+        return
+    raise HTTPException(404, f"no se encontro el bloque de {name} en config.toml")
+
+
 def insert_startup(lines: list[str], table: str, block: str) -> None:
     insert_block(lines, table, block, after=("repos",) if table == "services" else ())
 
@@ -391,10 +438,11 @@ def api_repos_add(body: RepoIn):
     startup = None
     if body.service is not None or body.library is not None:
         startup = startup_block(name, body)
+    install = install_line(kind, body.install)
     with _lock:
         lines = config_lines()
         insert_block(lines, "repos", f"[[repos]]\nname = {toml_str(name)}\npath = {toml_str(d.as_posix())}\n"
-                                     f"kind = {toml_str(kind)}\n")
+                                     f"kind = {toml_str(kind)}\n{install}")
         if startup:
             insert_startup(lines, *startup)
         write_config(lines)
@@ -409,8 +457,12 @@ def api_repos_startup(name: str, body: StartupIn):
     if repo_startup(name):
         raise HTTPException(409, f"{name} ya tiene arranque configurado (edita config.toml para cambiarlo)")
     table, block = startup_block(name, body)
+    repo = next(r for r in repos() if r["name"] == name)
+    install = install_line(repo.get("kind", "python"), body.install)
     with _lock:
         lines = config_lines()
+        if install:
+            set_block_line(lines, "repos", name, "install", install)
         insert_startup(lines, table, block)
         write_config(lines)
     return {"ok": True, "name": name, "startup": repo_startup(name)}
@@ -710,7 +762,7 @@ def api_up(name: str, force: bool = False):
         if not force:
             raise HTTPException(409, "un solo espacio de trabajo a la vez: "
                                 f"corren servicios de otro espacio ({', '.join(others)}). "
-                                "BÃ¡jalos antes (o usa force=true para cambiar de espacio)")
+                                "BÃƒÆ’Ã‚Â¡jalos antes (o usa force=true para cambiar de espacio)")
         with state_tx() as st:
             gone = [st["services"].pop(oid, None) for oid in others]
         for oentry in gone:
@@ -1083,11 +1135,13 @@ class Job:
 
 
 def deps_install(job: Job, rname: str, d: Path) -> None:
-    kind = next((r["kind"] for r in repos() if r["name"] == rname), "python")
-    cmd = ["npm", "install", "--no-audit", "--no-fund"] if kind == "npm" else ["uv", "sync"]
+    r = next((r for r in repos() if r["name"] == rname), {})
+    cmd = install_cmd(r)
+    if not cmd:
+        return
     job.step(f"{rname}: instalando dependencias ({' '.join(cmd[:2])})")
-    rc = job.run(cmd, d, 1800 if kind == "npm" else 900)
-    if rc != 0 and kind != "npm":
+    rc = job.run(cmd, d, 1800 if r.get("kind") == "npm" else 900)
+    if rc != 0 and cmd == DEFAULT_INSTALL["python"]:
         # registry de paquetes caido: reintentar con la cache local (wheels de otros repos)
         job.step(f"{rname}: uv sync --offline")
         rc = job.run(["uv", "sync", "--offline"], d, 900)
@@ -1096,8 +1150,10 @@ def deps_install(job: Job, rname: str, d: Path) -> None:
 
 
 def deps_missing(rname: str, d: Path) -> bool:
-    kind = next((r["kind"] for r in repos() if r["name"] == rname), "python")
-    return not (d / ("node_modules" if kind == "npm" else ".venv")).exists()
+    r = next((r for r in repos() if r["name"] == rname), {})
+    if not install_cmd(r):
+        return False
+    return not (d / ("node_modules" if r.get("kind") == "npm" else ".venv")).exists()
 
 
 def job_prepare(job: Job, prof: dict) -> None:
@@ -1191,7 +1247,7 @@ def start_job(profile: str, action: str) -> None:
         if busy:
             raise HTTPException(409, f"espera: {busy[0]} todavia esta trabajando")
         st.setdefault("jobs", {})[profile] = {"action": action, "status": "running",
-                                              "step": "parandoâ€¦" if action == "stop" else "empezandoâ€¦"}
+                                              "step": "parandoÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" if action == "stop" else "empezandoÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"}
     threading.Thread(target=run_job, args=(profile, action), daemon=True).start()
 
 
@@ -1425,6 +1481,25 @@ Reglas:
 - Arrancar un espacio para otro que este corriendo (force) y borrar un espacio
   (devws_remove_workspace) solo con confirmacion explicita del usuario.
 - Commits y push los hace el agente con git dentro de cada worktree, como siempre.
+
+Anadir un repo o configurar su arranque (devws_add_repo, devws_configure_startup):
+- En devws_status, un repo con startup=null no se puede arrancar: si la tarea lo
+  necesita, ofrece configurarlo.
+- Averigua el arranque leyendo el repo: .vscode/launch.json (la configuracion de
+  depuracion suele tener modulo, app y argumentos), pyproject.toml / package.json
+  (scripts start/dev), README, y PORT en .env. Copia el estilo de los servicios
+  que ya hay en devws_status (p. ej. "./.venv/bin/python -m uvicorn ..." para
+  python, "npm run start -- --port {port}" para npm).
+- El comando es una lista de argumentos; {port} se sustituye por el puerto. Corre
+  en la carpeta del repo (o de su worktree) con su .env. Usa un puerto que no
+  tenga ya otro servicio.
+- Dependencias (install): por defecto "uv sync" (python) o "npm install" (npm),
+  que devws ejecuta al preparar un worktree. Si el repo usa otra cosa (poetry,
+  pnpm, yarn, pip install -r ..., un Makefile), pasala en install.
+- Si el repo no tiene nada que arrancar y otros repos dependen de el (aparece en
+  su pyproject.toml), es una libreria: library = esos repos.
+- Propon al usuario el arranque (nombre, puerto, comando) y pide confirmacion
+  antes de guardarlo: se escribe en config.toml.
 """
 
 mcp = MCPServer("devws", instructions=MCP_INSTRUCTIONS)
@@ -1481,9 +1556,12 @@ def devws_status() -> dict:
     return {
         "workspace_root": str(WORKSPACE_ROOT),
         "repos": [{"name": r["name"], "path": str(repo_path(r["name"])), "kind": r.get("kind"),
-                   "current": st.get("current"), "dirty": st.get("dirty"), "error": st.get("error")}
+                   "current": st.get("current"), "dirty": st.get("dirty"), "error": st.get("error"),
+                   "startup": st.get("startup"), "install": st.get("install")}
                   for r, st in zip(repos(), api_repos())],
-        "services": [{"name": s["name"], "repo": s["repo"], "port": s["port"]} for s in services()],
+        "services": [{"name": s["name"], "repo": s["repo"], "port": s["port"], "cmd": s["cmd"]}
+                     for s in services()],
+        "libraries": CONFIG.get("libraries", []),
         "active_profile": state.get("active_profile"),
         "spaces": [space_info(n) for n in api_profiles_list()],
         "jobs": {p: j for p, j in state.get("jobs", {}).items() if j.get("status") == "running"},
@@ -1552,6 +1630,42 @@ def devws_remove_workspace(name: str, force: bool = False) -> dict:
         errors = tool_call(api_wt_remove, name, force=force)["errors"]
     api_profiles_delete(name)
     return {"ok": not errors, "errors": errors}
+
+
+@mcp.tool()
+def devws_add_repo(path: str, name: str | None = None, kind: str | None = None,
+                   service: ServiceIn | None = None, library: list[str] | None = None,
+                   install: list[str] | None = None) -> dict:
+    """Registra un repo git en devws, con su arranque si se indica.
+
+    path: ruta absoluta del repo (admite ~).
+    name: por defecto, el nombre de la carpeta. kind: "python" o "npm" (por
+      defecto npm si hay package.json, si no python): decide como se instalan
+      las dependencias en los worktrees.
+    service: como arrancarlo, {name, port, cmd: [args con {port}]}.
+    library: si es una libreria, los repos que la usan (en vez de service).
+    install: instalador de dependencias en los worktrees (por defecto uv sync /
+      npm install segun kind; [] = no instalar nada).
+    Sin service ni library se registra pendiente de configurar el arranque.
+    """
+    d = Path(path).expanduser()
+    if kind is None:
+        kind = "npm" if (d / "package.json").exists() else "python"
+    body = RepoIn(name=name or d.name, path=path, kind=kind, service=service, library=library,
+                  install=install)
+    tool_call(api_repos_add, body)
+    return next(r for r in devws_status()["repos"] if r["name"] == body.name)
+
+
+@mcp.tool()
+def devws_configure_startup(repo: str, service: ServiceIn | None = None,
+                            library: list[str] | None = None, install: list[str] | None = None) -> dict:
+    """Configura el arranque de un repo registrado que aun no lo tiene
+    (startup=null en devws_status): un servicio {name, port, cmd: [args con
+    {port}]} o, si es una libreria, los repos que la usan. install: instalador
+    de dependencias si no es el de su kind ([] = no instalar nada)."""
+    tool_call(api_repos_startup, repo, StartupIn(service=service, library=library, install=install))
+    return next(r for r in devws_status()["repos"] if r["name"] == repo)
 
 
 @app.get("/")

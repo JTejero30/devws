@@ -619,3 +619,54 @@ def test_anadir_repo_con_su_arranque_y_quitarlo(ws):
     c.delete("/api/repos/api2")
     assert tomllib.loads(cfg.read_text()) == tomllib.loads(before), "quitar deja la config como estaba"
     assert "api2" not in [s["id"] for s in c.get("/api/state")["services"]]
+
+
+def test_mcp_anade_repo_y_configura_su_arranque(ws):
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    before = (dws / "config.toml").read_text()
+    assert "launch.json" in mcp_rpc(c, "initialize", {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"}})["instructions"]
+
+    err, r = mcp_tool(c, "devws_add_repo", path=str(root / "web"), name="web2")
+    assert not err and r["kind"] == "npm" and r["startup"] is None, r
+    err, msg = mcp_tool(c, "devws_configure_startup", repo="web2",
+                        service={"name": "web2", "port": ws["ports"]["web"], "cmd": ["npm", "start"]})
+    assert err and "ya lo usa el servicio web" in msg
+    port = free_port()
+    err, r = mcp_tool(c, "devws_configure_startup", repo="web2",
+                      service={"name": "web2", "port": port, "cmd": ["npm", "run", "start", "--", "--port", "{port}"]})
+    assert not err and r["startup"] == "service", r
+    err, st = mcp_tool(c, "devws_status")
+    assert {"name": "web2", "repo": "web2", "port": port,
+            "cmd": ["npm", "run", "start", "--", "--port", "{port}"]} in st["services"]
+
+    err, r = mcp_tool(c, "devws_add_repo", path=str(root / "lib"), name="lib3", library=["api"])
+    assert not err and r["startup"] == "library", r
+    assert {"name": "lib3", "consumers": ["api"]} in mcp_tool(c, "devws_status")[1]["libraries"]
+
+    c.delete("/api/repos/lib3")
+    c.delete("/api/repos/web2")
+    assert tomllib.loads((dws / "config.toml").read_text()) == tomllib.loads(before)
+
+
+def test_instalador_de_dependencias_propio(ws):
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    cfg = dws / "config.toml"
+    before = cfg.read_text()
+    c.post("/api/repos", {"name": "lib5", "path": str(root / "lib"), "install": "uv sync", "library": []})
+    assert "install" not in tomllib.loads(cfg.read_text())["repos"][-1], "el de su kind no se escribe"
+    c.delete("/api/repos/lib5")
+
+    inst = [sys.executable, "-c", "open('INSTALADO', 'w').write('ok')"]
+    r = c.post("/api/repos", {"name": "lib4", "path": str(root / "lib"), "install": inst, "library": []})
+    assert {r["name"]: r for r in c.get("/api/repos")}["lib4"]["install"] == inst
+    c.post("/api/profiles", {"name": "inst", "repos": {"lib4": "inst-test"}, "bases": {"lib4": "main"},
+                             "services": [], "worktree": True})
+    prepare(c, "inst")
+    assert (dws / "worktrees" / "inst__lib4" / "INSTALADO").read_text() == "ok"
+    assert not (dws / "worktrees" / "inst__lib4" / ".venv").exists(), "no se lanza uv sync"
+    c.delete("/api/worktrees/inst?force=true")
+    c.delete("/api/profiles/inst")
+    c.delete("/api/repos/lib4")
+    assert tomllib.loads(cfg.read_text()) == tomllib.loads(before)
