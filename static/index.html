@@ -351,7 +351,7 @@ ${s && status !== "down" && !working ? `<button class="link" onclick="svcRestart
 
 let statusLine = "";
 if (working) statusLine = `<div class="status-line busy">${esc(job.step || "trabajando…")} <a href="#" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
-else if (job && job.status === "error") statusLine = `<div class="status-line err">${job.action === "stop" ? "Error al parar" : "Error al arrancar"}: ${esc(job.error)} <a href="#" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
+else if (job && job.status === "error") statusLine = `<div class="status-line err">${({ stop: "Error al parar", prepare: "Error al preparar", install: "Error al instalar dependencias" })[job.action] || "Error al arrancar"}: ${esc(job.error)} <a href="#" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
 else if (wt && wts && (wts.pending || []).length) statusLine = `<div class="status-line warn">${esc(wts.pending.join(", "))}: el perfil pide otra rama; se aplica al ${running ? "volver a " : ""}arrancar</div>`;
 
 const nm = esc(p.name);
