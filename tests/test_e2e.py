@@ -545,7 +545,8 @@ def test_mcp_crea_amplia_y_borra_un_espacio(ws):
     assert "worktree" in init["instructions"], "las instrucciones de uso viajan con el servidor"
     tools = {t["name"] for t in mcp_rpc(c, "tools/list")["tools"]}
     assert {"devws_status", "devws_create_workspace", "devws_start", "devws_stop",
-            "devws_remove_workspace"} <= tools
+            "devws_remove_workspace", "devws_add_repo", "devws_configure_startup", "devws_install_deps",
+            "devws_repo_config", "devws_update_repo"} <= tools
 
     err, st = mcp_tool(c, "devws_status")
     assert not err, st
@@ -719,3 +720,66 @@ def test_adoptar_en_perfil_nuevo_arranca_todos_los_servicios(ws):
     assert ids == ["adop2/worker", "adop2/api", "adop2/web"], "todos, en el orden de config.toml"
     c.delete("/api/worktrees/adop2")
     c.delete("/api/profiles/adop2")
+
+
+def test_ver_y_editar_la_configuracion_de_un_repo(ws):
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    cfg = dws / "config.toml"
+    before = cfg.read_text()
+    py, port, port2 = sys.executable, free_port(), free_port()
+    cmd = [py, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "{port}"]
+    c.post("/api/repos", {"name": "edt", "path": str(root / "api"),
+                          "service": {"name": "edt", "port": port, "cmd": cmd}})
+    conf = c.get("/api/repos/edt/config")
+    assert conf["services"] == [{"name": "edt", "port": port, "cmd": cmd}]
+    assert conf["install"] == ["uv", "sync"] and conf["install_is_default"] and conf["has_dotenv"]
+
+    # cmd escrito a mano en varias lineas y con comentarios: se edita sin romper nada
+    text = cfg.read_text()
+    one_line = "cmd = [" + ", ".join(json.dumps(a) for a in cmd) + "]\n"
+    assert one_line in text
+    head, _, tail = text.rpartition(one_line)  # el ultimo: el servicio api tiene el mismo cmd
+    cfg.write_text(head + "# arranque a mano\ncmd = [\n" + "".join(
+        f"  {json.dumps(a)},\n" for a in cmd) + "]  # fin\n" + tail)
+    ws["restart"]()
+
+    r = c.put("/api/repos/edt", {"services": [{"name": "edt", "port": port2, "cmd": cmd[:-1] + ["{port}", "--reload"]}],
+                                 "install": "uv sync --frozen", "copy_files": [".env"]})
+    assert r["services"][0]["port"] == port2 and r["services"][0]["cmd"][-1] == "--reload"
+    assert r["install"] == ["uv", "sync", "--frozen"] and not r["install_is_default"]
+    assert r["copy"] == [".env"]
+    text = cfg.read_text()
+    assert "# arranque a mano" in text and "  # fin" not in text, "se conserva el comentario de fuera"
+    assert tomllib.loads(text)["services"][-1]["cmd"] == cmd[:-1] + ["{port}", "--reload"]
+
+    r = c.put("/api/repos/edt", {"install": "uv sync", "copy_files": []})
+    assert r["install_is_default"] and r["copy"] == [], "el de por defecto y la lista vacia no se escriben"
+    blk = next(x for x in tomllib.loads(cfg.read_text())["repos"] if x["name"] == "edt")
+    assert "install" not in blk and "copy" not in blk
+
+    st, out = c.put("/api/repos/edt", {"services": [{"name": "edt", "port": ws["ports"]["api"], "cmd": cmd}]}, ok=False)
+    assert st == 409 and "ya lo usa el servicio api" in out["detail"]
+    st, out = c.put("/api/repos/edt", {"services": [{"name": "otro", "port": port, "cmd": cmd}]}, ok=False)
+    assert st == 404
+    st, out = c.put("/api/repos/edt", {"path": "relativo"}, ok=False)
+    assert st == 400
+    r = c.put("/api/repos/edt", {"path": str(root / "web"), "kind": "npm"})
+    assert r["resolved_path"] == str((root / "web").resolve()) and r["install"][0] == "npm"
+
+    r = c.delete("/api/repos/edt/startup")
+    assert r["services"] == [] and r["library"] is None
+    assert {x["name"]: x for x in c.get("/api/repos")}["edt"]["startup"] is None
+    c.delete("/api/repos/edt")
+    assert tomllib.loads(cfg.read_text()) == tomllib.loads(before)
+
+
+def test_mcp_ve_y_edita_la_configuracion_de_un_repo(ws):
+    c = ws["c"]
+    err, conf = mcp_tool(c, "devws_repo_config", repo="api")
+    assert not err and conf["services"][0]["name"] == "api" and conf["copy"] == [".env"]
+    err, r = mcp_tool(c, "devws_update_repo", repo="api", install=["uv", "sync", "--frozen"])
+    assert not err and r["install"] == ["uv", "sync", "--frozen"], r
+    err, r = mcp_tool(c, "devws_update_repo", repo="api", install=["uv", "sync"])
+    assert not err and r["install_is_default"]
+    err, msg = mcp_tool(c, "devws_repo_config", repo="nope")
+    assert err and "repo desconocido" in msg

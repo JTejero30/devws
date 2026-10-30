@@ -176,6 +176,7 @@ font-size:12px; flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-
 <button onclick="closeRepoForm()">Cancelar</button>
 </div>
 </div>
+<div id="repoEdit" style="display:none;margin:8px 0 10px;border:1px solid var(--border);border-radius:6px;padding:8px"></div>
 <div id="repos"></div>
 </div>
 </main>
@@ -623,6 +624,7 @@ ${r.startup === "library" ? '<span class="hint">librería</span>' : ""}
 ${r.startup ? "" : `<span class="badge warn" title="devws no sabe cómo arrancarlo">arranque sin configurar</span>
 <button class="link" onclick="openStartupForm('${esc(r.name)}')">configurar arranque</button>`}
 <span style="flex:1"></span>
+<button class="link" onclick="openRepoEdit('${esc(r.name)}')" title="ver y editar su carpeta, dependencias y arranque">configuración</button>
 <button class="link danger" onclick="removeRepo('${esc(r.name)}')" title="quitar de la config (no borra nada del disco)">quitar</button>
 </div>`).join("");
 const pending = repos.filter(r => !r.error && !r.startup).length;
@@ -657,6 +659,7 @@ while (used.has(p)) p++;
 return p;
 }
 function openRepoForm(forRepo = null) {
+closeRepoEdit();
 repoFormFor = forRepo;
 const r = forRepo && repos.find(x => x.name === forRepo);
 $("#repoFormTitle").textContent = forRepo ? `Arranque de ${forRepo}` : "Añadir repo";
@@ -721,6 +724,75 @@ toast(`repo "${name}" añadido ${what}`, !startup.service && !startup.library);
 }
 closeRepoForm(); refreshRepos(); kick();
 } catch (e) { toast(e.message, true); }
+}
+// ---------------------------------------------------------------- configuracion de un repo
+// ver y editar lo que devws usa de un repo: carpeta, tipo, dependencias, ficheros
+// que se copian al worktree y su arranque (servicios o libreria)
+let repoEditCfg = null;
+const shjoin = a => a.map(x => /^[\w@%+=:,./{}-]+$/.test(x) ? x : `'${x.replace(/'/g, "'\\''")}'`).join(" ");
+async function openRepoEdit(name) {
+closeRepoForm();
+let c;
+try { c = await api(`/api/repos/${enc(name)}/config`); } catch (e) { return toast(e.message, true); }
+repoEditCfg = c;
+const lbl = t => `<label class="name" style="font-weight:400">${t}</label>`;
+const svcRows = c.services.map((s, i) => `<div style="border-top:1px solid #21262d;padding-top:4px;margin-top:4px">
+<div class="row">${lbl("Servicio")}<b>${esc(s.name)}</b></div>
+<div class="row">${lbl("Puerto")}<input type="text" inputmode="numeric" style="width:90px" data-svcport="${i}" value="${s.port}"></div>
+<div class="row">${lbl("Comando")}<input type="text" style="width:520px;font-family:ui-monospace,monospace" data-svccmd="${i}" value="${esc(shjoin(s.cmd))}">
+<span class="hint" style="width:100%">Se ejecuta en <code>${esc(c.resolved_path)}</code> (o en su worktree) como: <code>${esc(shjoin(s.cmd.map(a => a.replace("{port}", s.port))))}</code></span></div>
+</div>`).join("");
+const libRows = c.library === null ? "" : `<div class="hint" style="margin:4px 0">Librería. Repos que la usan:</div>`
++ repos.filter(r => !r.error && r.name !== name).map(r => `<label class="opt"><input type="checkbox" data-libc="${esc(r.name)}" ${c.library.includes(r.name) ? "checked" : ""}><span>${esc(r.name)}</span></label>`).join("");
+const startup = c.services.length ? svcRows : c.library !== null ? libRows
+: `<div class="row"><span class="badge warn">arranque sin configurar</span><button class="link" onclick="closeRepoEdit();openStartupForm('${esc(name)}')">configurar arranque</button></div>`;
+$("#repoEdit").innerHTML = `<h3 style="margin:0 0 4px">Configuración de ${esc(name)}</h3>
+<div class="row">${lbl("Carpeta")}<input type="text" id="rePath" style="width:420px" value="${esc(c.path)}" ${c.worktrees.length ? "disabled title='tiene worktrees: bórralos antes de cambiar su carpeta'" : ""}>
+<span class="hint" style="width:100%">${esc(c.resolved_path)} · .env: ${c.has_dotenv ? "sí (se carga al arrancar sus servicios)" : "no"}${c.worktrees.length ? ` · worktrees en: ${esc(c.worktrees.join(", "))}` : ""}</span></div>
+<div class="row">${lbl("Tipo")}<select id="reKind" style="flex:0 1 110px"><option value="python" ${c.kind === "python" ? "selected" : ""}>python</option><option value="npm" ${c.kind === "npm" ? "selected" : ""}>npm</option></select></div>
+<div class="row">${lbl("Dependencias")}<input type="text" id="reInstall" style="width:520px;font-family:ui-monospace,monospace" value="${esc(shjoin(c.install))}">
+<span class="hint" style="width:100%">${c.install_is_default ? "el de por defecto para su tipo · " : ""}se ejecuta en el worktree al arrancarlo (solo si cambian sus lockfiles). Vacío = no instala nada.</span></div>
+<div class="row">${lbl("Copiar al worktree")}<input type="text" id="reCopy" style="width:420px" value="${esc(c.copy.join(", "))}" placeholder="ej: .env, wiring.toml">
+<span class="hint" style="width:100%">Ficheros ignorados por git que se copian del repo original a cada worktree nuevo.</span></div>
+<div class="sect">Arranque</div>${startup}
+<div class="p-actions">
+<button class="primary" onclick="saveRepoEdit()">Guardar</button>
+<button onclick="closeRepoEdit()">Cancelar</button>
+${c.services.length || c.library !== null ? `<span style="flex:1"></span><button class="link danger" onclick="removeStartup()" title="quita sus servicios o su bloque de librería; queda pendiente de configurar">quitar arranque</button>` : ""}
+</div>`;
+$("#repoEdit").style.display = "block";
+$("#repoEdit").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+function closeRepoEdit() { $("#repoEdit").style.display = "none"; repoEditCfg = null; }
+async function saveRepoEdit() {
+const c = repoEditCfg;
+const body = {
+kind: $("#reKind").value,
+install: $("#reInstall").value.trim(),
+copy_files: $("#reCopy").value.split(",").map(x => x.trim()).filter(Boolean),
+};
+if (!$("#rePath").disabled) body.path = $("#rePath").value.trim();
+if (c.services.length) {
+body.services = c.services.map((s, i) => ({
+name: s.name, port: Number(document.querySelector(`[data-svcport="${i}"]`).value),
+cmd: document.querySelector(`[data-svccmd="${i}"]`).value.trim(),
+}));
+if (body.services.some(s => !Number.isInteger(s.port) || s.port < 1 || s.port > 65535)) return toast("puerto inválido", true);
+}
+if (c.library !== null) body.library = [...document.querySelectorAll("[data-libc]:checked")].map(x => x.dataset.libc);
+try {
+const r = await api(`/api/repos/${enc(c.name)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+toast(r.warn ? `${c.name}: guardado. ${r.warn}` : `${c.name}: configuración guardada`);
+closeRepoEdit(); refreshRepos(); kick();
+} catch (e) { toast(e.message, true); }
+}
+async function removeStartup() {
+const c = repoEditCfg;
+const what = c.services.length ? `sus servicios (${c.services.map(s => s.name).join(", ")})` : "su configuración de librería";
+if (!confirm(`¿Quitar el arranque de ${c.name}? Se borran ${what} de la config y queda pendiente de configurar.`)) return;
+try { await api(`/api/repos/${enc(c.name)}/startup`, { method: "DELETE" }); toast(`${c.name}: arranque quitado`); }
+catch (e) { return toast(e.message, true); }
+closeRepoEdit(); refreshRepos(); kick();
 }
 async function removeRepo(name) {
 const own = services.filter(s => s.repo === name && !s.wt).map(s => s.name);
