@@ -61,6 +61,7 @@ button:disabled { opacity:.4; cursor:default; }
 .p-line { display:flex; gap:8px; align-items:center; font-size:12px; padding:2px 0; }
 .p-line .k { width:190px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; }
 .p-line code { color:var(--accent); }
+.p-line select.p-branch { flex:0 1 240px; min-width:120px; padding:1px 6px; font-size:12px; }
 .status-line { font-size:12px; margin-top:10px; padding:6px 10px; border-radius:6px; background:#161b22; }
 .status-line.busy { color:var(--yellow); }
 .status-line.err { color:var(--red); }
@@ -334,7 +335,27 @@ const repoLines = Object.keys(pr).length
 + (bases[r] && !(repos.find(x => x.name === r) || {}).branches?.includes(b) ? ` <span class="hint">nueva desde ${esc(bases[r])}</span>` : "")
 + `</div>`).join("")
 : `<div class="p-line hint">ningún repo incluido</div>`;
-const rest = wt ? `<div class="p-line hint">resto de repos: corren desde su carpeta original, en la rama que tengan</div>` : "";
+// worktree: el resto de repos estan en su carpeta original; se ve su rama y se
+// puede cambiar (checkout en el original). Primero los que corren aqui.
+let rest = "";
+if (wt) {
+const runsHere = {};
+for (const n of profSvcs(p)) {
+const r = (services.find(x => x.name === n) || {}).repo;
+if (r && pr[r] === undefined) (runsHere[r] = runsHere[r] || []).push(n);
+}
+const others = repos.filter(r => !r.error && pr[r.name] === undefined)
+.sort((a, b) => !!runsHere[b.name] - !!runsHere[a.name]);
+rest = others.length ? `<div class="sect">Desde su carpeta original</div>` + others.map(r => `<div class="p-line">
+<span class="k">${esc(r.name)}</span>
+<select class="p-branch" data-repo="${esc(r.name)}" data-current="${esc(r.current || "")}" onchange="checkout(this)">
+${r.current ? "" : '<option value="" selected>(sin rama)</option>'}
+${r.branches.map(b => `<option value="${esc(b)}" ${b === r.current ? "selected" : ""}>${esc(b)}</option>`).join("")}
+</select>
+${r.dirty ? '<span class="badge dirty">cambios sin commitear</span>' : ""}
+<span class="hint">${runsHere[r.name] ? `corre aquí: ${esc(runsHere[r.name].join(", "))}` : "no arranca en este espacio"}</span>
+</div>`).join("") : "";
+}
 
 const svcLines = profSvcs(p).map(n => {
 const s = svcOf(p, n);
@@ -379,6 +400,8 @@ ${wtBtns}
 }
 
 function renderProfiles() {
+if (document.activeElement && document.activeElement.closest && document.activeElement.closest("#profilesList")
+&& document.activeElement.tagName === "SELECT") return;
 const list = Object.values(profiles);
 $("#profilesList").innerHTML = list.length ? list.map(profileCard).join("")
 : '<div class="empty">Todavía no hay espacios. Crea uno con <b>+ Nuevo</b>.</div>';
@@ -607,7 +630,7 @@ $("#reposWarn").innerHTML = pending
 ? `<span class="badge warn">${pending} ${pending === 1 ? "repo" : "repos"} sin arranque configurado</span>` : "";
 }
 async function checkout(sel) {
-const name = sel.closest(".row").dataset.repo;
+const name = sel.dataset.repo || sel.closest(".row").dataset.repo;
 const branch = sel.value;
 if (!confirm(`¿Cambiar ${name} a la rama ${branch} en su carpeta original?\n\nAfecta a los servicios que corren desde el original.`)) {
 sel.value = sel.dataset.current; sel.blur(); return;
