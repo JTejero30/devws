@@ -706,3 +706,16 @@ def test_dependencias_solo_si_cambian_sus_ficheros(ws):
     c.delete("/api/worktrees/dhash?force=true")
     assert not (dws / "worktrees" / "dhash__lib.deps").exists(), "se borra la marca con el worktree"
     c.delete("/api/profiles/dhash")
+
+
+def test_adoptar_en_perfil_nuevo_arranca_todos_los_servicios(ws):
+    c, dws = ws["c"], ws["dws"]
+    sh(ws["root"] / "commons" / "worker", "git", "worktree", "add", "-q", "-b", "adop2-w",
+       str(dws / "worktrees" / "adop2__worker"))
+    c.post("/api/worktrees/orphans/adop2__worker/adopt")
+    wait_job(c, "adop2")
+    assert c.get("/api/profiles/adop2")["services"]["services"] == []
+    ids = [s["id"] for s in c.get("/api/state")["services"] if s.get("profile") == "adop2"]
+    assert ids == ["adop2/worker", "adop2/api", "adop2/web"], "todos, en el orden de config.toml"
+    c.delete("/api/worktrees/adop2")
+    c.delete("/api/profiles/adop2")
