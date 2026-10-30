@@ -13,7 +13,8 @@ kind = "python"
 # opcional: ficheros ignorados por git que se copian del repo original a cada
 # worktree nuevo (nunca sobrescribe), p. ej. el wiring que hoy se edita a mano:
 # copy = [".env", "wiring.toml"]
-# opcional: instalador de dependencias al preparar un worktree. Por defecto
+# opcional: instalador de dependencias de un worktree (al arrancarlo, solo si
+# cambian uv.lock, package-lock.json...). Por defecto
 # "uv sync" (kind python) o "npm install --no-audit --no-fund" (kind npm);
 # [] = no instalar nada.
 # install = ["uv", "sync", "--frozen"]

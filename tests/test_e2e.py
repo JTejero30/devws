@@ -280,6 +280,17 @@ def prepare(c: Client, prof: str, expect: str = "ok") -> dict:
     return wait_job(c, prof, expect)
 
 
+def install(c: Client, prof: str, expect: str = "ok") -> dict:
+    """Worktrees + dependencias (sin arrancar servicios) y espera."""
+    c.post(f"/api/profiles/{prof}/install")
+    return wait_job(c, prof, expect)
+
+
+def installed_now(c: Client, prof: str) -> bool:
+    """El ultimo trabajo del perfil ejecuto algun instalador de dependencias."""
+    return any("instalando dependencias" in l for l in c.get(f"/api/logs/{prof}--actividad")["lines"])
+
+
 def test_worktree_ciclo(ws):
     c, ports, dws = ws["c"], ws["ports"], ws["dws"]
     c.post("/api/profiles", {"name": "wt1", "repos": {"api": "feat-a", "worker": "feat-a"},
@@ -288,6 +299,10 @@ def test_worktree_ciclo(ws):
     assert w["repos"] == {"api": "feat-a", "worker": "feat-a"} and w["pending"] == []
     wt_api = dws / "worktrees" / "wt1__api"
     assert (wt_api / "BRANCH").read_text() == "feat-a"
+    assert not (wt_api / ".venv").exists(), "preparar no instala dependencias"
+    r = c.post("/api/services/wt/wt1/api/up?force=true")
+    assert not r["ok"] and r["error"] == "deps", r
+    install(c, "wt1")
     assert (wt_api / ".venv").is_dir(), "uv sync no se ejecuto en el worktree"
     assert (wt_api / ".env").read_text() == "DEVWS_TEST=1\n", 'copy = [".env"] copia el ignorado'
     assert not (dws / "worktrees" / "wt1__worker" / ".env").exists(), "sin copy no se copia nada"
@@ -347,7 +362,7 @@ def test_perfil_parcial_servicios_desde_el_original(ws):
     c, ports, root, dws = ws["c"], ws["ports"], ws["root"], ws["dws"]
     c.post("/api/profiles", {"name": "parcial", "repos": {"api": "feat-a"},
                              "services": ["web", "api"], "worktree": True})
-    w = prepare(c, "parcial")
+    w = install(c, "parcial")
     assert list(w["repos"]) == ["api"]
     assert not (dws / "worktrees" / "parcial__web").exists(), "web no esta en el perfil: sin worktree"
     assert c.post("/api/services/wt/parcial/web/up?force=true")["ok"]
@@ -663,10 +678,31 @@ def test_instalador_de_dependencias_propio(ws):
     assert {r["name"]: r for r in c.get("/api/repos")}["lib4"]["install"] == inst
     c.post("/api/profiles", {"name": "inst", "repos": {"lib4": "inst-test"}, "bases": {"lib4": "main"},
                              "services": [], "worktree": True})
-    prepare(c, "inst")
+    install(c, "inst")
     assert (dws / "worktrees" / "inst__lib4" / "INSTALADO").read_text() == "ok"
     assert not (dws / "worktrees" / "inst__lib4" / ".venv").exists(), "no se lanza uv sync"
     c.delete("/api/worktrees/inst?force=true")
     c.delete("/api/profiles/inst")
     c.delete("/api/repos/lib4")
     assert tomllib.loads(cfg.read_text()) == tomllib.loads(before)
+
+
+def test_dependencias_solo_si_cambian_sus_ficheros(ws):
+    c, dws = ws["c"], ws["dws"]
+    c.post("/api/profiles", {"name": "dhash", "repos": {"lib": "dhash-a"}, "bases": {"lib": "main"},
+                             "services": [], "worktree": True})
+    install(c, "dhash")
+    assert installed_now(c, "dhash")
+    install(c, "dhash")
+    assert not installed_now(c, "dhash"), "mismos ficheros de dependencias: no reinstala"
+    c.put("/api/profiles", {"name": "dhash", "repos": {"lib": "dhash-b"}, "bases": {"lib": "main"},
+                            "services": [], "worktree": True})
+    install(c, "dhash")
+    assert not installed_now(c, "dhash"), "cambiar de rama no reinstala si no cambian"
+    wt = dws / "worktrees" / "dhash__lib"
+    (wt / "pyproject.toml").write_text((wt / "pyproject.toml").read_text() + "\n# cambio\n")
+    install(c, "dhash")
+    assert installed_now(c, "dhash"), "cambio pyproject.toml: reinstala"
+    c.delete("/api/worktrees/dhash?force=true")
+    assert not (dws / "worktrees" / "dhash__lib.deps").exists(), "se borra la marca con el worktree"
+    c.delete("/api/profiles/dhash")

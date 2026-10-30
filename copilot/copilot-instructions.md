@@ -8,6 +8,9 @@ Este workspace tiene varios repos gestionados por devws (herramientas MCP `devws
   originales, propon un espacio worktree (nombre corto, repos, rama de cada uno y base si la
   rama es nueva). **Pide confirmacion** y llama a `devws_create_workspace`.
 - Despues edita **solo** en las rutas de `dirs` que devuelve, nunca en los repos originales.
+- Para explorar o leer codigo no crees nada: lee los repos originales. Crear un espacio no
+  instala dependencias (se instalan al arrancarlo); para pasar tests en un worktree sin
+  arrancarlo, llama antes a `devws_install_deps`.
 - Si a mitad de tarea hace falta otro repo, vuelve a llamar a `devws_create_workspace` con el
   mismo nombre y ese repo: se anade al espacio.
 - Un cambio pequeno en un solo repo y en su rama actual se hace en el sitio, sin worktree.

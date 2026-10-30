@@ -169,7 +169,7 @@ font-size:12px; flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-
 <div id="libConsumers"></div>
 </div>
 <div class="row"><label class="name" style="font-weight:400">Dependencias</label><input type="text" id="repoInstall" style="width:520px;font-family:ui-monospace,monospace" oninput="this.dataset.touched=1">
-<span class="hint" style="width:100%">Comando que instala las dependencias al preparar un worktree. Vacío = no instala nada.</span></div>
+<span class="hint" style="width:100%">Comando que instala las dependencias de un worktree al arrancarlo (solo si cambian uv.lock, package-lock.json…). Vacío = no instala nada.</span></div>
 <div class="p-actions">
 <button class="primary" id="repoSaveBtn" onclick="saveRepo()">Añadir</button>
 <button onclick="closeRepoForm()">Cancelar</button>

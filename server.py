@@ -1,5 +1,6 @@
 """Front local multi-repo: ramas, servicios y perfiles de trabajo."""
 
+import hashlib
 import json
 import os
 import re
@@ -73,7 +74,7 @@ def save_state(state: dict) -> None:
 
 @contextmanager
 def state_tx():
-    """load ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ modificar ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ save bajo _lock, para no pisar cambios de otros hilos.
+    """load ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ modificar ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ save bajo _lock, para no pisar cambios de otros hilos.
     No hacer dentro nada lento (git, kill, esperas de puerto)."""
     with _lock:
         state = load_state()
@@ -143,7 +144,7 @@ def port_pids(port: int, conns: list | None = None) -> list[int]:
 
 def port_server_pids(port: int) -> list[int]:
     """Pids que parecen servidores en el puerto pero sin socket LISTEN (p. ej.
-    CLOSED de un uvicorn zombi): no aceptan conexiones pero sÃƒÆ’Ã‚Â­ bloquean el
+    CLOSED de un uvicorn zombi): no aceptan conexiones pero sÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â­ bloquean el
     bind (address already in use). Ignora conexiones ESTABLISHED y los pids
     propios de devws."""
     return sorted({pid for p, pid, st in tcp_conns()
@@ -338,7 +339,7 @@ def config_lines() -> list[str]:
 
 
 def write_config(lines: list[str]) -> None:
-    """Escritura atomica: .tmp ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ validar con tomllib ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ replace ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ recargar CONFIG."""
+    """Escritura atomica: .tmp ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ validar con tomllib ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ replace ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ recargar CONFIG."""
     text = "".join(lines)
     try:
         new = tomllib.loads(text)
@@ -753,6 +754,9 @@ def _svc_ctx(name: str):
 @app.post("/api/services/{name}/up")
 def api_up(name: str, force: bool = False):
     svc, prof, port, p, wt_dir = _svc_ctx(name)
+    if wt_dir is not None and deps_missing(svc["repo"], wt_dir):
+        return {"ok": False, "error": "deps",
+                "msg": f"{svc['repo']}: el worktree no tiene dependencias; arranca el espacio para instalarlas"}
     state = load_state()
     entry = state["services"].get(name)
     if entry and pid_alive(entry["pid"]) and not force:
@@ -762,7 +766,7 @@ def api_up(name: str, force: bool = False):
         if not force:
             raise HTTPException(409, "un solo espacio de trabajo a la vez: "
                                 f"corren servicios de otro espacio ({', '.join(others)}). "
-                                "BÃƒÆ’Ã‚Â¡jalos antes (o usa force=true para cambiar de espacio)")
+                                "BÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡jalos antes (o usa force=true para cambiar de espacio)")
         with state_tx() as st:
             gone = [st["services"].pop(oid, None) for oid in others]
         for oentry in gone:
@@ -1147,6 +1151,37 @@ def deps_install(job: Job, rname: str, d: Path) -> None:
         rc = job.run(["uv", "sync", "--offline"], d, 900)
     if rc != 0:
         raise RuntimeError(f"{rname}: fallo la instalacion de dependencias (codigo {rc})")
+    # despues de instalar: uv sync / npm install pueden crear o tocar el lockfile
+    deps_stamp_file(d).write_text(deps_hash(rname, d))
+
+
+# ficheros que definen las dependencias: si no cambian, no se reinstala
+DEPS_FILES = ("uv.lock", "pyproject.toml", "requirements.txt", "package-lock.json", "package.json")
+
+
+def deps_stamp_file(d: Path) -> Path:
+    # junto al worktree, no dentro: dentro saldria como fichero sin versionar
+    return d.with_name(d.name + ".deps")
+
+
+def deps_hash(rname: str, d: Path) -> str:
+    r = next((r for r in repos() if r["name"] == rname), {})
+    h = hashlib.sha256(json.dumps(install_cmd(r)).encode())
+    for f in DEPS_FILES:
+        if (d / f).is_file():
+            h.update(f.encode() + b"\0" + (d / f).read_bytes())
+    return h.hexdigest()
+
+
+def deps_needed(rname: str, d: Path) -> bool:
+    """Faltan las dependencias o cambiaron sus ficheros desde la ultima instalacion."""
+    if deps_missing(rname, d):
+        return True
+    r = next((r for r in repos() if r["name"] == rname), {})
+    if not install_cmd(r):
+        return False
+    f = deps_stamp_file(d)
+    return not f.exists() or f.read_text().strip() != deps_hash(rname, d)
 
 
 def deps_missing(rname: str, d: Path) -> bool:
@@ -1156,19 +1191,20 @@ def deps_missing(rname: str, d: Path) -> bool:
     return not (d / ("node_modules" if r.get("kind") == "npm" else ".venv")).exists()
 
 
-def job_prepare(job: Job, prof: dict) -> None:
-    """Worktrees en su rama y con dependencias (solo reinstala si cambian)."""
+def job_prepare(job: Job, prof: dict, deps: bool = False) -> None:
+    """Worktrees en su rama. Con deps, tambien sus dependencias, y solo si
+    cambiaron los ficheros que las definen (lockfiles), no por cambiar de rama.
+    Para explorar o editar no hacen falta: se instalan al arrancar."""
     bases = prof.get("bases", {})
     for rname, branch in prof.get("repos", {}).items():
         d = wt_dir_for(job.profile, rname)
-        try:
-            before = git(d, "branch", "--show-current", timeout=5).strip() if d.is_dir() else None
-        except RuntimeError:
-            before = None
-        job.step(f"{rname}: worktree en {branch}" if before is None else f"{rname}: comprobando worktree")
+        job.step(f"{rname}: worktree en {branch}" if not d.is_dir() else f"{rname}: comprobando worktree")
         wt_ensure(rname, branch, job.profile, bases.get(rname))
-        if before != branch or deps_missing(rname, d):
-            deps_install(job, rname, d)
+    if deps:
+        for rname in prof.get("repos", {}):
+            d = wt_dir_for(job.profile, rname)
+            if deps_needed(rname, d):
+                deps_install(job, rname, d)
 
 
 def job_checkout(job: Job, prof: dict) -> None:
@@ -1194,7 +1230,7 @@ def job_start(job: Job, prof: dict, services_too: bool = True) -> list[str]:
             job.step(f"parando {sid} (otro espacio)")
             api_down(sid)
     if is_wt:
-        job_prepare(job, prof)
+        job_prepare(job, prof, deps=services_too or job.action == "install")
     else:
         job_checkout(job, prof)
     if not services_too:
@@ -1247,7 +1283,7 @@ def start_job(profile: str, action: str) -> None:
         if busy:
             raise HTTPException(409, f"espera: {busy[0]} todavia esta trabajando")
         st.setdefault("jobs", {})[profile] = {"action": action, "status": "running",
-                                              "step": "parandoÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦" if action == "stop" else "empezandoÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦"}
+                                              "step": "parandoÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦" if action == "stop" else "empezandoÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¦"}
     threading.Thread(target=run_job, args=(profile, action), daemon=True).start()
 
 
@@ -1294,10 +1330,21 @@ def api_profile_stop(name: str):
 
 @app.post("/api/profiles/{name}/prepare")
 def api_profile_prepare(name: str):
-    """Solo worktrees + dependencias, sin arrancar servicios."""
+    """Solo los worktrees en su rama (sin dependencias ni servicios): rapido,
+    basta para explorar o editar."""
     if not _profile_or_404(name).get("worktree"):
         raise HTTPException(400, f"{name} no es un perfil worktree")
     start_job(name, "prepare")
+    return {"ok": True}
+
+
+@app.post("/api/profiles/{name}/install")
+def api_profile_install(name: str):
+    """Worktrees + dependencias (las que hayan cambiado), sin arrancar servicios:
+    p. ej. para pasar los tests en el worktree."""
+    if not _profile_or_404(name).get("worktree"):
+        raise HTTPException(400, f"{name} no es un perfil worktree")
+    start_job(name, "install")
     return {"ok": True}
 
 
@@ -1352,7 +1399,7 @@ def api_wt_adopt(dir: str):
     profile_file(prof).write_text(profile_body(req, old.get("created_at") if old else None))
     start_job(prof, "prepare")
     return {"ok": True, "profile": prof,
-            "msg": f"{rname} adoptado en el perfil {prof}; comprobando deps en segundo plano"}
+            "msg": f"{rname} adoptado en el perfil {prof}; comprobando el worktree en segundo plano"}
 
 
 def wt_remove_dirs(dirs: list[tuple[str, Path]], force: bool) -> list[str]:
@@ -1366,6 +1413,7 @@ def wt_remove_dirs(dirs: list[tuple[str, Path]], force: bool) -> list[str]:
     for rname, d in dirs:
         try:
             git(repo_path(rname), "worktree", "remove", "--force", str(d), timeout=120)
+            deps_stamp_file(d).unlink(missing_ok=True)
         except (RuntimeError, HTTPException) as e:
             errs.append(f"{rname}: {e.detail if isinstance(e, HTTPException) else e}")
     return errs
@@ -1474,8 +1522,13 @@ Cuando usarlo:
 - Un cambio pequeno en un solo repo y en su rama actual se hace en el sitio, sin worktree.
 
 Reglas:
+- Para explorar o leer codigo no crees nada: lee los repos originales.
 - Tras crear un espacio, edita SOLO en las rutas que devuelve (dirs), nunca en
   los repos originales. Los repos que no estan en el espacio no se tocan.
+- Crear un espacio solo prepara los worktrees (segundos): las dependencias se
+  instalan al arrancarlo (devws_start). Si necesitas pasar tests o linters en un
+  worktree sin arrancar servicios, llama antes a devws_install_deps. Solo se
+  reinstala lo que cambio (uv.lock, package-lock.json...).
 - Si a mitad de tarea hace falta otro repo, llama otra vez a
   devws_create_workspace con el mismo nombre y solo ese repo: se anade.
 - Arrancar un espacio para otro que este corriendo (force) y borrar un espacio
@@ -1494,7 +1547,7 @@ Anadir un repo o configurar su arranque (devws_add_repo, devws_configure_startup
   en la carpeta del repo (o de su worktree) con su .env. Usa un puerto que no
   tenga ya otro servicio.
 - Dependencias (install): por defecto "uv sync" (python) o "npm install" (npm),
-  que devws ejecuta al preparar un worktree. Si el repo usa otra cosa (poetry,
+  que devws ejecuta en un worktree al arrancarlo o con devws_install_deps. Si el repo usa otra cosa (poetry,
   pnpm, yarn, pip install -r ..., un Makefile), pasala en install.
 - Si el repo no tiene nada que arrancar y otros repos dependen de el (aparece en
   su pyproject.toml), es una libreria: library = esos repos.
@@ -1571,8 +1624,9 @@ def devws_status() -> dict:
 @mcp.tool()
 def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, str] | None = None,
                            services: list[str] | None = None, start: bool = False) -> dict:
-    """Crea (o amplia, si ya existe) un espacio worktree y deja los worktrees
-    listos con dependencias. Devuelve en `dirs` la ruta de cada worktree: edita ahi.
+    """Crea (o amplia, si ya existe) un espacio worktree: deja cada worktree en
+    su rama, sin instalar dependencias (se instalan al arrancar o con
+    devws_install_deps). Devuelve en `dirs` la ruta de cada worktree: edita ahi.
 
     name: nombre corto del espacio (letras, numeros, . _ -), p. ej. la feature.
     repos: repo -> rama. Si la rama no existe se crea desde bases[repo] o desde
@@ -1599,6 +1653,14 @@ def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, st
         tool_call(api_profile_start, name, force=True)
     else:
         tool_call(start_job, name, "prepare")
+    return {**wait_job_done(name), **space_info(name)}
+
+
+@mcp.tool()
+def devws_install_deps(name: str) -> dict:
+    """Instala las dependencias de los worktrees del espacio (solo las que
+    cambiaron) sin arrancar servicios: para pasar tests o linters en ellos."""
+    tool_call(api_profile_install, name)
     return {**wait_job_done(name), **space_info(name)}
 
 
