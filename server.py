@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -72,7 +73,7 @@ def save_state(state: dict) -> None:
 
 @contextmanager
 def state_tx():
-    """load → modificar → save bajo _lock, para no pisar cambios de otros hilos.
+    """load â†’ modificar â†’ save bajo _lock, para no pisar cambios de otros hilos.
     No hacer dentro nada lento (git, kill, esperas de puerto)."""
     with _lock:
         state = load_state()
@@ -142,7 +143,7 @@ def port_pids(port: int, conns: list | None = None) -> list[int]:
 
 def port_server_pids(port: int) -> list[int]:
     """Pids que parecen servidores en el puerto pero sin socket LISTEN (p. ej.
-    CLOSED de un uvicorn zombi): no aceptan conexiones pero sí bloquean el
+    CLOSED de un uvicorn zombi): no aceptan conexiones pero sÃ­ bloquean el
     bind (address already in use). Ignora conexiones ESTABLISHED y los pids
     propios de devws."""
     return sorted({pid for p, pid, st in tcp_conns()
@@ -215,6 +216,7 @@ def api_repos():
         try:
             st = repo_status(r["name"])
             st["kind"] = r["kind"]
+            st["startup"] = repo_startup(r["name"])
             out.append(st)
         except Exception as e:
             out.append({"name": r["name"], "error": str(e)})
@@ -239,10 +241,131 @@ def toml_str(s: str) -> str:
     return "".join(out) + '"'
 
 
-class RepoIn(BaseModel):
+class ServiceIn(BaseModel):
+    name: str
+    port: int
+    # lista de argumentos, o una linea que se parte como en la shell
+    cmd: list[str] | str
+
+
+class StartupIn(BaseModel):
+    """Como se arranca un repo: un servicio, o es una libreria (sus consumidores)."""
+    service: ServiceIn | None = None
+    library: list[str] | None = None
+
+
+class RepoIn(StartupIn):
     name: str
     path: str
     kind: str = "python"
+
+
+def repo_startup(name: str) -> str | None:
+    if any(s["repo"] == name for s in services()):
+        return "service"
+    if any(l["name"] == name for l in CONFIG.get("libraries", [])):
+        return "library"
+    return None
+
+
+def startup_block(repo: str, st: StartupIn) -> tuple[str, str]:
+    """Valida el arranque y devuelve (tabla, bloque TOML) para config.toml."""
+    if (st.service is None) == (st.library is None):
+        raise HTTPException(400, "indica un servicio o que es una libreria (uno de los dos)")
+    if st.service is not None:
+        s = st.service
+        check_name(s.name, "servicio")
+        if any(x["name"] == s.name for x in services()):
+            raise HTTPException(409, f"servicio ya existe: {s.name}")
+        if not 0 < s.port < 65536:
+            raise HTTPException(400, f"puerto invalido: {s.port}")
+        clash = next((x["name"] for x in services() if x["port"] == s.port), None)
+        if clash:
+            raise HTTPException(409, f"el puerto {s.port} ya lo usa el servicio {clash}")
+        try:
+            cmd = shlex.split(s.cmd) if isinstance(s.cmd, str) else s.cmd
+        except ValueError as e:
+            raise HTTPException(400, f"comando invalido: {e}")
+        if not cmd or not all(c.strip() for c in cmd):
+            raise HTTPException(400, "falta el comando de arranque")
+        return "services", (f"[[services]]\nname = {toml_str(s.name)}\nrepo = {toml_str(repo)}\n"
+                            f"port = {s.port}\ncmd = [{', '.join(toml_str(c) for c in cmd)}]\n")
+    known = {r["name"] for r in repos()}
+    consumers = list(dict.fromkeys(st.library))
+    for c in consumers:
+        if c == repo:
+            raise HTTPException(400, "una libreria no puede consumirse a si misma")
+        if c not in known:
+            raise HTTPException(404, f"repo desconocido: {c}")
+    return "libraries", (f"[[libraries]]\nname = {toml_str(repo)}\n"
+                         f"consumers = [{', '.join(toml_str(c) for c in consumers)}]\n")
+
+
+# --- config.toml: edicion por bloques [[tabla]], siempre bajo _lock ----------
+
+def config_lines() -> list[str]:
+    return (ROOT / "config.toml").read_text().splitlines(keepends=True)
+
+
+def write_config(lines: list[str]) -> None:
+    """Escritura atomica: .tmp â†’ validar con tomllib â†’ replace â†’ recargar CONFIG."""
+    text = "".join(lines)
+    try:
+        new = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        raise HTTPException(400, f"config.toml quedaria invalido: {e}")
+    cfg_file = ROOT / "config.toml"
+    tmp = cfg_file.with_suffix(".toml.tmp")
+    tmp.write_text(text)
+    tmp.replace(cfg_file)
+    CONFIG.clear()
+    CONFIG.update(new)
+
+
+def block_end(lines: list[str], start: int) -> int:
+    """Fin del bloque que empieza en `start`: el siguiente header, sin los
+    comentarios y blancos que lo preceden (son del bloque siguiente)."""
+    j = next((k for k in range(start + 1, len(lines)) if lines[k].strip().startswith("[")), len(lines))
+    while j > start + 1 and (not lines[j - 1].strip() or lines[j - 1].lstrip().startswith("#")):
+        j -= 1
+    return j
+
+
+def table_starts(lines: list[str], table: str) -> list[int]:
+    return [i for i, l in enumerate(lines) if l.strip() == f"[[{table}]]"]
+
+
+def insert_block(lines: list[str], table: str, block: str, after: tuple[str, ...] = ()) -> None:
+    """Inserta `block` tras el ultimo [[table]] (si no hay, tras el ultimo de
+    `after`, o al final): el orden de los [[services]] es el de arranque."""
+    pos = len(lines)
+    for t in (table, *after):
+        starts = table_starts(lines, t)
+        if starts:
+            pos = block_end(lines, starts[-1])
+            break
+    if pos and not lines[pos - 1].endswith("\n"):
+        lines[pos - 1] += "\n"
+    lines[pos:pos] = ["\n", block]
+
+
+def remove_block(lines: list[str], table: str, name: str) -> bool:
+    for s in table_starts(lines, table):
+        e = block_end(lines, s)
+        try:
+            found = tomllib.loads("".join(lines[s + 1:e])).get("name") == name
+        except tomllib.TOMLDecodeError:
+            continue
+        if found:
+            if s > 0 and not lines[s - 1].strip():
+                s -= 1
+            del lines[s:e]
+            return True
+    return False
+
+
+def insert_startup(lines: list[str], table: str, block: str) -> None:
+    insert_block(lines, table, block, after=("repos",) if table == "services" else ())
 
 
 @app.post("/api/repos")
@@ -264,66 +387,59 @@ def api_repos_add(body: RepoIn):
     d = d.resolve()
     if not (d / ".git").exists():
         raise HTTPException(400, f"no hay repo git en {d}")
+    # sin arranque tambien se anade: la UI lo marca como pendiente de configurar
+    startup = None
+    if body.service is not None or body.library is not None:
+        startup = startup_block(name, body)
     with _lock:
-        cfg_file = ROOT / "config.toml"
-        lines = cfg_file.read_text().splitlines(keepends=True)
-        block = f"[[repos]]\nname = {toml_str(name)}\npath = {toml_str(d.as_posix())}\nkind = {toml_str(kind)}\n\n"
-        try:
-            i = next(j for j, l in enumerate(lines) if l.lstrip().startswith("[[services]]"))
-        except StopIteration:
-            raise HTTPException(400, "config.toml sin seccion [[services]]")
-        lines.insert(i, "\n" if lines[i - 1].strip() else "")
-        lines.insert(i + 1, block)
-        tmp = cfg_file.with_suffix(".toml.tmp")
-        tmp.write_text("".join(lines))
-        tomllib.load(open(tmp, "rb"))
-        tmp.replace(cfg_file)
-        CONFIG.clear()
-        CONFIG.update(tomllib.load(open(cfg_file, "rb")))
-    return {"ok": True, "name": name}
+        lines = config_lines()
+        insert_block(lines, "repos", f"[[repos]]\nname = {toml_str(name)}\npath = {toml_str(d.as_posix())}\n"
+                                     f"kind = {toml_str(kind)}\n")
+        if startup:
+            insert_startup(lines, *startup)
+        write_config(lines)
+    return {"ok": True, "name": name, "startup": repo_startup(name)}
+
+
+@app.post("/api/repos/{name}/startup")
+def api_repos_startup(name: str, body: StartupIn):
+    """Configura el arranque de un repo que aun no lo tiene."""
+    if name not in {r["name"] for r in repos()}:
+        raise HTTPException(404, f"repo desconocido: {name}")
+    if repo_startup(name):
+        raise HTTPException(409, f"{name} ya tiene arranque configurado (edita config.toml para cambiarlo)")
+    table, block = startup_block(name, body)
+    with _lock:
+        lines = config_lines()
+        insert_startup(lines, table, block)
+        write_config(lines)
+    return {"ok": True, "name": name, "startup": repo_startup(name)}
 
 
 @app.delete("/api/repos/{name}")
 def api_repos_del(name: str):
     if name not in {r["name"] for r in repos()}:
         raise HTTPException(404, "repo desconocido")
-    in_use = [s["name"] for s in services() if s["repo"] == name]
-    if in_use:
-        raise HTTPException(409, f"tiene servicios asociados: {', '.join(in_use)}")
+    # se quita con su arranque (sus [[services]] y su [[libraries]]), salvo si corre
+    own = [s["name"] for s in services() if s["repo"] == name]
+    running = [sid for sid, e in load_state()["services"].items()
+               if e and pid_alive(e["pid"]) and sid.split("/")[-1] in own]
+    if running:
+        raise HTTPException(409, f"tiene servicios arrancados: {', '.join(running)}; paralos antes")
+    libs = [l["name"] for l in CONFIG.get("libraries", []) if name in l.get("consumers", [])]
+    if libs:
+        raise HTTPException(409, f"consume la(s) libreria(s) {', '.join(libs)}: quitalo de alli antes")
     used = {prof for prof, w in wt_profiles().items() if name in w["repos"]}
     if used:
         raise HTTPException(409, f"en uso por perfil(s): {', '.join(sorted(used))}")
     with _lock:
-        cfg_file = ROOT / "config.toml"
-        lines = cfg_file.read_text().splitlines(keepends=True)
-        # un bloque [[repos]] termina en el siguiente header de seccion [...] o en otro [[repos]]
-        def next_header(i: int) -> int:
-            for j in range(i + 1, len(lines)):
-                t = lines[j].strip()
-                if t.startswith("[") and not t.startswith("#"):
-                    return j
-            return len(lines)
-        starts = [i for i, l in enumerate(lines) if l.strip() == "[[repos]]"]
-        ends = [next_header(s) for s in starts]
-        removed = None
-        for k, s in enumerate(starts):
-            if any(l.strip().startswith(f'name = "{name}"') for l in lines[s:ends[k]]):
-                removed = k
-                break
-        if removed is None:
+        lines = config_lines()
+        if not remove_block(lines, "repos", name):
             raise HTTPException(404, "no se encontro el bloque del repo en config.toml")
-        s, e = starts[removed], ends[removed]
-        if s > 0 and not lines[s - 1].strip():
-            s -= 1
-        if e < len(lines) and not lines[e].strip():
-            e += 1
-        del lines[s:e]
-        tmp = cfg_file.with_suffix(".toml.tmp")
-        tmp.write_text("".join(lines))
-        tomllib.load(open(tmp, "rb"))
-        tmp.replace(cfg_file)
-        CONFIG.clear()
-        CONFIG.update(tomllib.load(open(cfg_file, "rb")))
+        for s in own:
+            remove_block(lines, "services", s)
+        remove_block(lines, "libraries", name)
+        write_config(lines)
     return {"ok": True, "name": name}
 
 
@@ -594,7 +710,7 @@ def api_up(name: str, force: bool = False):
         if not force:
             raise HTTPException(409, "un solo espacio de trabajo a la vez: "
                                 f"corren servicios de otro espacio ({', '.join(others)}). "
-                                "Bájalos antes (o usa force=true para cambiar de espacio)")
+                                "BÃ¡jalos antes (o usa force=true para cambiar de espacio)")
         with state_tx() as st:
             gone = [st["services"].pop(oid, None) for oid in others]
         for oentry in gone:
@@ -1075,7 +1191,7 @@ def start_job(profile: str, action: str) -> None:
         if busy:
             raise HTTPException(409, f"espera: {busy[0]} todavia esta trabajando")
         st.setdefault("jobs", {})[profile] = {"action": action, "status": "running",
-                                              "step": "parando…" if action == "stop" else "empezando…"}
+                                              "step": "parandoâ€¦" if action == "stop" else "empezandoâ€¦"}
     threading.Thread(target=run_job, args=(profile, action), daemon=True).start()
 
 

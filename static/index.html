@@ -32,7 +32,7 @@ main { display:flex; flex-direction:column; gap:16px; padding:16px 20px; max-wid
 .row:last-child { border-bottom:none; }
 .name { width:210px; font-weight:600; }
 .badge { font-size:11px; padding:1px 8px; border-radius:10px; border:1px solid var(--border); color:var(--dim); white-space:nowrap; }
-.badge.dirty, .badge.starting { color:var(--yellow); border-color:var(--yellow); }
+.badge.dirty, .badge.starting, .badge.warn { color:var(--yellow); border-color:var(--yellow); }
 .badge.up { color:var(--green); border-color:var(--green); }
 .badge.external { color:var(--accent); border-color:var(--accent); }
 .badge.err { color:var(--red); border-color:var(--red); }
@@ -139,14 +139,37 @@ font-size:12px; flex:1; overflow-y:auto; white-space:pre-wrap; word-break:break-
 <div class="card-head">
 <h2>Repositorios</h2>
 <button onclick="openRepoForm()" title="añade el repo a la config">+ añadir repo</button>
+<span id="reposWarn"></span>
 <span class="hint">Rama actual de cada repo en su carpeta original. Cambiarla aquí hace checkout.</span>
 </div>
 <div id="repoForm" style="display:none;margin:8px 0 10px;border:1px solid var(--border);border-radius:6px;padding:8px">
-<div class="row"><label class="name" style="font-weight:400">Nombre</label><input type="text" id="repoName" placeholder="ej: mi-nuevo-repo"></div>
+<h3 id="repoFormTitle" style="margin:0 0 4px">Añadir repo</h3>
+<div id="repoBasic">
+<div class="row"><label class="name" style="font-weight:400">Nombre</label><input type="text" id="repoName" placeholder="ej: mi-nuevo-repo" oninput="repoNameChange()"></div>
 <div class="row"><label class="name" style="font-weight:400">Path</label><input type="text" id="repoPath" placeholder="path absoluto, ej: ~/Proyectos/mi-repo o /Users/yo/Proyectos/commons/otro" style="width:420px"></div>
-<div class="row"><label class="name" style="font-weight:400">Tipo</label><select id="repoKind" style="flex:0 1 110px"><option value="python">python</option><option value="npm">npm</option></select></div>
+<div class="row"><label class="name" style="font-weight:400">Tipo</label><select id="repoKind" style="flex:0 1 110px" onchange="repoKindChange()"><option value="python">python</option><option value="npm">npm</option></select></div>
+</div>
+<div class="sect">Arranque</div>
+<div style="padding-left:2px">
+<label class="opt"><input type="radio" name="repoStartup" value="service" checked onchange="repoStartupChange()">
+<span><b>Servicio</b><br><span class="hint">devws lo arranca con un comando en un puerto.</span></span></label>
+<label class="opt"><input type="radio" name="repoStartup" value="library" onchange="repoStartupChange()">
+<span><b>Librería</b><br><span class="hint">No se arranca. Al cambiarle la rama, devws hace uv sync en ella y en los repos que la usan.</span></span></label>
+<label class="opt" id="repoLaterOpt"><input type="radio" name="repoStartup" value="later" onchange="repoStartupChange()">
+<span><b>Lo configuro luego</b><br><span class="hint">Se añade igual, marcado como «arranque sin configurar».</span></span></label>
+</div>
+<div id="repoSvc">
+<div class="row"><label class="name" style="font-weight:400">Servicio</label><input type="text" id="svcName" placeholder="nombre del servicio" oninput="this.dataset.touched=1"></div>
+<div class="row"><label class="name" style="font-weight:400">Puerto</label><input type="text" id="svcPort" inputmode="numeric" style="width:90px"></div>
+<div class="row"><label class="name" style="font-weight:400">Comando</label><input type="text" id="svcCmd" style="width:520px;font-family:ui-monospace,monospace" oninput="this.dataset.touched=1">
+<span class="hint" style="width:100%">{port} se sustituye por el puerto. Se ejecuta en la carpeta del repo (o de su worktree) y con su .env.</span></div>
+</div>
+<div id="repoLib" style="display:none">
+<div class="hint" style="margin:4px 0">Repos que usan esta librería:</div>
+<div id="libConsumers"></div>
+</div>
 <div class="p-actions">
-<button class="primary" onclick="saveRepo()">Añadir</button>
+<button class="primary" id="repoSaveBtn" onclick="saveRepo()">Añadir</button>
 <button onclick="closeRepoForm()">Cancelar</button>
 </div>
 </div>
@@ -571,9 +594,15 @@ $("#repos").innerHTML = repos.map(r => r.error
 ${r.branches.map(b => `<option value="${esc(b)}" ${b === r.current ? "selected" : ""}>${esc(b)}</option>`).join("")}
 </select>
 ${r.dirty ? '<span class="badge dirty">cambios sin commitear</span>' : ""}
+${r.startup === "library" ? '<span class="hint">librería</span>' : ""}
+${r.startup ? "" : `<span class="badge warn" title="devws no sabe cómo arrancarlo">arranque sin configurar</span>
+<button class="link" onclick="openStartupForm('${esc(r.name)}')">configurar arranque</button>`}
 <span style="flex:1"></span>
 <button class="link danger" onclick="removeRepo('${esc(r.name)}')" title="quitar de la config (no borra nada del disco)">quitar</button>
 </div>`).join("");
+const pending = repos.filter(r => !r.error && !r.startup).length;
+$("#reposWarn").innerHTML = pending
+? `<span class="badge warn">${pending} ${pending === 1 ? "repo" : "repos"} sin arranque configurado</span>` : "";
 }
 async function checkout(sel) {
 const name = sel.closest(".row").dataset.repo;
@@ -588,19 +617,82 @@ toast(`${it.repo}: ${it.ok ? "ahora en " + it.branch : it.error}`, !it.ok);
 } catch (e) { toast(e.message, true); }
 refreshRepos(); kick();
 }
-function openRepoForm() { $("#repoForm").style.display = "block"; $("#repoName").focus(); }
-function closeRepoForm() { $("#repoForm").style.display = "none"; $("#repoName").value = ""; $("#repoPath").value = ""; }
+// el mismo formulario sirve para añadir un repo (con su arranque) o para
+// configurar el arranque de uno ya añadido (repoFormFor = su nombre)
+let repoFormFor = null;
+const DEFAULT_CMD = {
+python: "./.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port {port} --reload",
+npm: "npm run start -- --port {port}",
+};
+function freePort() {
+const used = new Set(services.map(s => s.port));
+let p = Math.max(7999, ...used) + 1;
+while (used.has(p)) p++;
+return p;
+}
+function openRepoForm(forRepo = null) {
+repoFormFor = forRepo;
+const r = forRepo && repos.find(x => x.name === forRepo);
+$("#repoFormTitle").textContent = forRepo ? `Arranque de ${forRepo}` : "Añadir repo";
+$("#repoBasic").style.display = forRepo ? "none" : "block";
+$("#repoLaterOpt").style.display = forRepo ? "none" : "flex";
+$("#repoSaveBtn").textContent = forRepo ? "Guardar arranque" : "Añadir";
+if (r) $("#repoKind").value = r.kind || "python";
+document.querySelector("input[name=repoStartup][value=service]").checked = true;
+for (const id of ["#svcName", "#svcCmd"]) delete $(id).dataset.touched;
+$("#svcName").value = forRepo || "";
+$("#svcPort").value = freePort();
+$("#svcCmd").value = DEFAULT_CMD[$("#repoKind").value];
+repoStartupChange();
+$("#repoForm").style.display = "block";
+$("#repoForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
+(forRepo ? $("#svcName") : $("#repoName")).focus();
+}
+function openStartupForm(name) { openRepoForm(name); }
+function closeRepoForm() { $("#repoForm").style.display = "none"; $("#repoName").value = ""; $("#repoPath").value = ""; repoFormFor = null; }
+function repoNameChange() { if (!$("#svcName").dataset.touched) $("#svcName").value = $("#repoName").value.trim(); }
+function repoKindChange() { if (!$("#svcCmd").dataset.touched) $("#svcCmd").value = DEFAULT_CMD[$("#repoKind").value]; }
+function repoStartupChange() {
+const mode = document.querySelector("input[name=repoStartup]:checked").value;
+$("#repoSvc").style.display = mode === "service" ? "block" : "none";
+$("#repoLib").style.display = mode === "library" ? "block" : "none";
+if (mode === "library") {
+const cands = repos.filter(r => !r.error && r.kind === "python" && r.name !== repoFormFor);
+$("#libConsumers").innerHTML = cands.length
+? cands.map(r => `<label class="opt"><input type="checkbox" data-consumer="${esc(r.name)}"><span>${esc(r.name)}</span></label>`).join("")
+: '<span class="hint">no hay otros repos python</span>';
+}
+}
+function startupBody() {
+const mode = document.querySelector("input[name=repoStartup]:checked").value;
+if (mode === "library") return { library: [...document.querySelectorAll("[data-consumer]:checked")].map(c => c.dataset.consumer) };
+if (mode !== "service") return {};
+const name = $("#svcName").value.trim(), port = Number($("#svcPort").value), cmd = $("#svcCmd").value.trim();
+if (!name || !cmd) throw new Error("falta el nombre del servicio o el comando");
+if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("puerto inválido");
+return { service: { name, port, cmd } };
+}
 async function saveRepo() {
+let startup;
+try { startup = startupBody(); } catch (e) { return toast(e.message, true); }
+const what = startup.service ? `con el servicio ${startup.service.name} (:${startup.service.port})`
+: startup.library ? "como librería" : "— falta configurar su arranque";
+try {
+if (repoFormFor) {
+await post(`/api/repos/${enc(repoFormFor)}/startup`, startup);
+toast(`${repoFormFor}: arranque guardado ${what}`);
+} else {
 const name = $("#repoName").value.trim(), path = $("#repoPath").value.trim(), kind = $("#repoKind").value;
 if (!name || !path) return toast("falta nombre o path", true);
-try {
-await post("/api/repos", { name, path, kind });
-toast(`repo "${name}" añadido: ya puedes incluirlo en los espacios`);
+await post("/api/repos", { name, path, kind, ...startup });
+toast(`repo "${name}" añadido ${what}`, !startup.service && !startup.library);
+}
 closeRepoForm(); refreshRepos(); kick();
 } catch (e) { toast(e.message, true); }
 }
 async function removeRepo(name) {
-if (!confirm(`¿Quitar el repo "${name}" de la config? (no se borra nada del disco)`)) return;
+const own = services.filter(s => s.repo === name && !s.wt).map(s => s.name);
+if (!confirm(`¿Quitar el repo "${name}" de la config${own.length ? ` y su arranque (${own.join(", ")})` : ""}? (no se borra nada del disco)`)) return;
 try { await api(`/api/repos/${enc(name)}`, { method: "DELETE" }); toast(`repo "${name}" quitado de la config`); }
 catch (e) { toast(e.message, true); }
 refreshRepos(); kick();

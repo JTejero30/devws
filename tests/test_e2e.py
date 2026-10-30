@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -575,3 +576,46 @@ def test_anadir_repo_con_path_absoluto(ws):
     assert f'path = "{(root / "api").resolve().as_posix()}"' in (ws["dws"] / "config.toml").read_text()
     assert {r["name"]: r for r in c.get("/api/repos")}["api2"]["current"] == "main"
     c.delete("/api/repos/api2")
+
+
+def test_anadir_repo_con_su_arranque_y_quitarlo(ws):
+    c, root, dws, ports = ws["c"], ws["root"], ws["dws"], ws["ports"]
+    cfg = dws / "config.toml"
+    before = cfg.read_text()
+    port = free_port()
+    py = sys.executable
+    svc_body = {"name": "api2", "port": port,
+                "cmd": [py, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "{port}"]}
+
+    st, out = c.post("/api/repos", {"name": "x", "path": str(root / "api"),
+                                    "service": {**svc_body, "name": "x", "port": ports["api"]}}, ok=False)
+    assert st == 409 and "ya lo usa el servicio api" in out["detail"]
+    assert cfg.read_text() == before, "si el arranque no vale no se anade nada"
+    st, out = c.post("/api/repos", {"name": "x", "path": str(root / "api"),
+                                    "service": svc_body, "library": []}, ok=False)
+    assert st == 400
+
+    r = c.post("/api/repos", {"name": "api2", "path": str(root / "api"), "service": svc_body})
+    assert r["startup"] == "service"
+    assert [s["id"] for s in c.get("/api/state")["services"]][-1] == "api2", "al final del orden de arranque"
+    assert {r["name"]: r for r in c.get("/api/repos")}["api2"]["startup"] == "service"
+    r = c.post("/api/services/api2/up")
+    assert r["ok"], r
+    assert fetch(port) == str(root / "api")
+    st, out = c.delete("/api/repos/api2", ok=False)
+    assert st == 409 and "arrancados" in out["detail"]
+    c.post("/api/services/api2/down")
+    wait_for(lambda: fetch(port) is None, 15, "api2 caido")
+
+    r = c.post("/api/repos", {"name": "lib2", "path": str(root / "lib")})
+    assert r["startup"] is None, "sin arranque se anade igual, pendiente de configurar"
+    r = c.post("/api/repos/lib2/startup", {"library": ["api", "api2"]})
+    assert r["startup"] == "library"
+    assert c.post("/api/repos/lib2/startup", {"library": []}, ok=False)[0] == 409
+    st, out = c.delete("/api/repos/api2", ok=False)
+    assert st == 409 and "lib2" in out["detail"], "no se quita un consumidor de una libreria"
+
+    c.delete("/api/repos/lib2")
+    c.delete("/api/repos/api2")
+    assert tomllib.loads(cfg.read_text()) == tomllib.loads(before), "quitar deja la config como estaba"
+    assert "api2" not in [s["id"] for s in c.get("/api/state")["services"]]
