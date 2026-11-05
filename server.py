@@ -1108,13 +1108,57 @@ def api_logs_tail(lines: int = 200):
     return events
 
 
+LOG_READ_MAX = 2 * 1024 * 1024  # bytes que se leen como mucho de un log por peticion
+LOG_LINE_MAX = 4000  # caracteres de la linea a medio escribir y de lo que se escribe
+
+
+def read_log(f: Path, lines: int, offset: int | None = None, gen: str | None = None) -> dict:
+    """Cola del log, o solo las lineas completas nuevas desde `offset` si `gen`
+    (la primera linea del log) sigue siendo la misma. Si el log se ha reescrito
+    (servicio rearrancado), el offset no cuadra o hay demasiado nuevo, devuelve
+    la cola con reset=True. `offset` apunta al final de la ultima linea completa;
+    `partial` es la linea a medio escribir."""
+    if not f.exists():
+        return {"lines": [], "offset": 0, "gen": "", "partial": "", "reset": bool(offset)}
+    with open(f, "rb") as fh:
+        first = fh.readline(LOG_LINE_MAX).decode(errors="replace").rstrip("\r\n")
+        size = fh.seek(0, os.SEEK_END)
+        reset = offset is not None and (gen != first or offset < 0 or offset > size
+                                        or size - offset > LOG_READ_MAX)
+        tail = offset is None or reset
+        start = max(0, size - LOG_READ_MAX) if tail else offset
+        fh.seek(start)
+        data = fh.read(size - start)
+    cut = data.rfind(b"\n") + 1
+    out = data[:cut].decode(errors="replace").splitlines()
+    if tail:
+        if start > 0 and out:
+            out = out[1:]  # la primera puede estar cortada por la mitad
+        out = out[-lines:] if lines > 0 else []
+    return {"lines": out, "offset": start + cut, "gen": first,
+            "partial": data[cut:].decode(errors="replace")[-LOG_LINE_MAX:], "reset": reset}
+
+
 @app.get("/api/logs/{name}")
-def api_logs(name: str, lines: int = 150):
+def api_logs(name: str, lines: int = 150, offset: int | None = None, gen: str | None = None):
+    return read_log(log_file_for(name), lines, offset, gen)
+
+
+class LogWrite(BaseModel):
+    text: str
+
+
+@app.post("/api/logs/{name}/write")
+def api_logs_write(name: str, body: LogWrite):
+    """Escribe una linea en el log (lo que se teclea en la terminal de la UI)."""
+    if len(body.text) > LOG_LINE_MAX:
+        raise HTTPException(400, f"texto demasiado largo (maximo {LOG_LINE_MAX} caracteres)")
     f = log_file_for(name)
     if not f.exists():
-        return {"lines": []}
-    content = f.read_bytes().decode(errors="replace").splitlines()
-    return {"lines": content[-lines:]}
+        raise HTTPException(404, f"no hay log de {name}")
+    with open(f, "ab") as fh:
+        fh.write((body.text + "\n").encode())
+    return {"ok": True}
 
 
 @app.get("/api/profiles")
@@ -1595,8 +1639,14 @@ def api_wt_down_svc(profile: str, name: str):
 
 
 @app.get("/api/logs/wt/{profile}/{name}")
-def api_wt_logs(profile: str, name: str, lines: int = 150):
-    return api_logs(f"{profile}/{name}", lines=lines)
+def api_wt_logs(profile: str, name: str, lines: int = 150,
+                offset: int | None = None, gen: str | None = None):
+    return api_logs(f"{profile}/{name}", lines=lines, offset=offset, gen=gen)
+
+
+@app.post("/api/logs/wt/{profile}/{name}/write")
+def api_wt_logs_write(profile: str, name: str, body: LogWrite):
+    return api_logs_write(f"{profile}/{name}", body)
 
 
 def wt_down_profile(profile: str) -> list:

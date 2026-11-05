@@ -783,3 +783,49 @@ def test_mcp_ve_y_edita_la_configuracion_de_un_repo(ws):
     assert not err and r["install_is_default"]
     err, msg = mcp_tool(c, "devws_repo_config", repo="nope")
     assert err and "repo desconocido" in msg
+
+
+def test_logs_incrementales_y_escritura(ws):
+    c, logs = ws["c"], ws["dws"] / "logs"
+    logs.mkdir(exist_ok=True)
+    f = logs / "term.log"
+    f.write_bytes(b"=== up term ===\n" + b"".join(f"linea {i}\n".encode() for i in range(300)) + b"a medi")
+    q = lambda **kw: c.get("/api/logs/term?" + urllib.parse.urlencode(kw))
+
+    r = q()
+    assert r["lines"] == [f"linea {i}" for i in range(150, 300)] and not r["reset"]
+    assert r["gen"] == "=== up term ===" and r["partial"] == "a medi"
+    assert r["offset"] == f.stat().st_size - len("a medi")
+    assert len(q(lines=1000)["lines"]) == 301
+
+    # incremental: solo lineas completas nuevas; la parcial se completa
+    off, gen = r["offset"], r["gen"]
+    r = q(offset=off, gen=gen)
+    assert r["lines"] == [] and r["offset"] == off and r["partial"] == "a medi" and not r["reset"]
+    with open(f, "ab") as fh:
+        fh.write(b"o\nnueva\n")
+    r = q(offset=off, gen=gen)
+    assert r["lines"] == ["a medio", "nueva"] and r["partial"] == "" and not r["reset"]
+    assert r["offset"] == f.stat().st_size
+
+    # escribir desde la terminal
+    off = r["offset"]
+    c.post("/api/logs/term/write", {"text": "hola"})
+    c.post("/api/logs/term/write", {"text": ""})
+    r = q(offset=off, gen=gen)
+    assert r["lines"] == ["hola", ""] and not r["reset"]
+    st, _ = c.post("/api/logs/term/write", {"text": "x" * 4001}, ok=False)
+    assert st == 400
+    st, _ = c.post("/api/logs/no-existe/write", {"text": "hola"}, ok=False)
+    assert st == 404
+    st, _ = c.post("/api/logs/wt/nadie/term/write", {"text": "hola"}, ok=False)
+    assert st == 404
+    assert c.get("/api/logs/wt/nadie/term")["lines"] == []
+
+    # log reescrito (servicio rearrancado): reset y cola
+    f.write_bytes(b"=== up term otra vez ===\ncorta\n")
+    r = q(offset=off, gen=gen)
+    assert r["reset"] and r["lines"] == ["=== up term otra vez ===", "corta"]
+    r = q(offset=10 ** 9, gen=r["gen"])
+    assert r["reset"] and r["lines"][-1] == "corta"
+    f.unlink()
