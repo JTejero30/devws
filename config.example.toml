@@ -8,7 +8,7 @@ web_port = 5000
 
 [[repos]]
 name = "api-gateway"
-path = "api-gateway"
+path = "~/Proyectos/api-gateway"
 kind = "python"
 # opcional: ficheros ignorados por git que se copian del repo original a cada
 # worktree nuevo (nunca sobrescribe), p. ej. el wiring que hoy se edita a mano:
@@ -21,31 +21,33 @@ kind = "python"
 
 [[repos]]
 name = "search-service"
-path = "search-service"
+path = "~/Proyectos/search-service"
 kind = "python"
 
 [[repos]]
 name = "web-portal"
-path = "web-portal"
+path = "~/Proyectos/web-portal"
 kind = "npm"
 
 [[repos]]
 name = "core-lib"
-path = "core-lib"
+path = "~/Proyectos/core-lib"
 kind = "python"
 
 [[repos]]
 name = "db-service"
-path = "../commons/db-service"
+path = "~/Proyectos/commons/db-service"
 kind = "python"
 
+# Arranque: cada repo es un servicio ([[services]]) o una libreria ([[libraries]]).
+# Un repo sin ninguno de los dos sale en la UI como "arranque sin configurar".
 # Orden de arranque = orden de aparicion aqui.
 [[services]]
 name = "db"
 repo = "db-service"
 port = 5432
 # .venv directo (como el launch.json): "uv run" re-resuelve deps contra el registry de paquetes
-# en cada arranque y cae si el registry no responde; el venv lo puebla wt_prep (uv sync)
+# en cada arranque y cae si el registry no responde; el venv lo crea su install (uv sync)
 cmd = ["./.venv/bin/python", "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "{port}", "--reload"]
 
 [[services]]
