@@ -237,7 +237,16 @@ return "";
 }
 async function api(path, opts) {
 const r = await fetch(path, opts);
-const j = await r.json();
+const text = await r.text();
+let j;
+try { j = JSON.parse(text); }
+catch {
+// ruta que el servidor no conoce: suele ser un server.py viejo aun corriendo
+const e = new Error(r.status === 404
+? `el servidor no tiene ${path.split("?")[0]}: si acabas de actualizar devws, reinícialo`
+: `${r.status} ${text.slice(0, 200)}`);
+e.status = r.status; e.noRoute = r.status === 404; throw e;
+}
 if (!r.ok) { const e = new Error(j.detail || j.msg || JSON.stringify(j)); e.status = r.status; throw e; }
 return j;
 }
@@ -992,7 +1001,7 @@ this.scrollBottom();
 }
 async write(text) {
 try { await post(`${logUrl(this.id)}/write`, { text }); }
-catch (e) { if (e.status !== 404) toast(e.message, true); return false; }
+catch (e) { if (e.status !== 404 || e.noRoute) toast(e.message, true); return false; }
 this.poll();
 return true;
 }
