@@ -854,9 +854,20 @@ def resolve_base(p: Path, name: str, branch: str, base: str | None) -> str:
         if _ref_exists(p, f"refs/heads/{base}"):
             return base
         raise HTTPException(400, f"{name}: no existe la rama base {base}")
-    if _ref_exists(p, "refs/remotes/origin/HEAD"):
-        return "origin/HEAD"
+    if default := default_branch(p):
+        return f"origin/{default}"
     raise HTTPException(400, f"{name}: {branch} no existe; indica desde que rama crearla")
+
+
+def default_branch(p: Path) -> str | None:
+    """Rama por defecto de origin (sin el origin/): la de origin/HEAD o, si el
+    repo no la tiene (no se clono, se le anadio el remoto), main o master."""
+    if _ref_exists(p, "refs/remotes/origin/HEAD"):
+        try:
+            return git(p, "symbolic-ref", "--short", "refs/remotes/origin/HEAD").strip().removeprefix("origin/")
+        except RuntimeError:
+            pass
+    return next((b for b in ("main", "master") if _ref_exists(p, f"refs/remotes/origin/{b}")), None)
 
 
 def is_ancestor(repo_dir: Path, a: str, b: str) -> bool:
