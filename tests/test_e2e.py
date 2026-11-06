@@ -93,9 +93,9 @@ class Client:
                                      headers={"Content-Type": "application/json", "X-Devws": "1"})
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
-                status, raw = r.status, r.read()
+                status, raw, self.headers = r.status, r.read(), r.headers
         except urllib.error.HTTPError as e:
-            status, raw = e.code, e.read()
+            status, raw, self.headers = e.code, e.read(), e.headers
         out = json.loads(raw) if raw[:1] in (b"{", b"[") else raw.decode()
         if ok:
             assert status < 400, f"{method} {path} -> {status}: {out}"
@@ -410,7 +410,8 @@ def test_rama_abierta_en_otro_sitio_no_se_fuerza(ws):
     c, dws = ws["c"], ws["dws"]
     c.post("/api/profiles", {"name": "dup", "repos": {"api": "main"}, "worktree": True})
     w = prepare(c, "dup", expect="error")
-    assert "ya esta abierta" in w["error"]
+    assert "ya está abierta en la carpeta original de api" in w["error"], w
+    assert "fuera del espacio" in w["error"] and str(ws["root"]) not in w["error"], "accionable y sin rutas"
     assert not (dws / "worktrees" / "dup__api").exists()
     c.delete("/api/profiles/dup")
 
@@ -491,7 +492,8 @@ def test_arrancar_parar_y_cambiar_de_espacio(ws):
     assert fetch(ports["worker"]) == str(root / "commons" / "worker"), "worker no esta en el perfil: original"
     # otro espacio arrancado: 409 sin force, con force cambia de espacio
     status, out = c.post("/api/profiles/eb/start", ok=False)
-    assert status == 409 and "esta arrancado ea" in out["detail"]
+    assert status == 409 and "está arrancado ea" in out["detail"]
+    assert c.headers["X-Devws-Code"] == "other_space_running", "la UI lo reconoce por el codigo"
     c.post("/api/profiles/eb/start?force=true")
     wait_job(c, "eb")
     st = c.get("/api/state")
@@ -514,7 +516,7 @@ def test_error_al_arrancar_se_ve_en_el_trabajo(ws):
     c = ws["c"]
     c.post("/api/profiles", {"name": "roto", "repos": {"api": "main"}, "worktree": True})
     j = (c.post("/api/profiles/roto/start"), wait_job(c, "roto", expect="error"))[1]
-    assert "ya esta abierta" in j["error"]
+    assert "ya está abierta" in j["error"], j
     assert c.get("/api/state")["active_profile"] is None
     assert all(s["status"] == "down" for s in c.get("/api/state")["services"]), "no arranca servicios si falla"
     c.delete("/api/profiles/roto")

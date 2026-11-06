@@ -122,8 +122,48 @@ def git(repo_dir: Path, *args: str, timeout: int = 90, cancellable: bool = False
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         rc, out, err = run_cancellable(proc, timeout)
     if rc != 0:
-        raise RuntimeError(err.strip() or out.strip())
+        raise RuntimeError(git_msg(err.strip() or out.strip()))
     return out
+
+
+def place(path: str | Path) -> str:
+    """Una carpeta dicha para el usuario: la original de un repo, el worktree de
+    un espacio o, si no es de devws, su ruta (con ~)."""
+    d = Path(path).resolve()
+    if d.parent == WT_DIR.resolve() and "__" in d.name:
+        return f"el espacio {d.name.partition('__')[0]}"
+    for r in repos():
+        if repo_path(r["name"]) == d:
+            return f"la carpeta original de {r['name']}"
+    home = str(Path.home())
+    return "~" + str(d)[len(home):] if str(d).startswith(home + os.sep) else str(d)
+
+
+def git_msg(err: str) -> str:
+    """Error de git en español y sin rutas de devws (lo leen la UI y el MCP).
+    Lo que no se reconoce se deja como viene, sin el prefijo fatal:/error:."""
+    if m := re.search(r"'([^']+)' is already (?:checked out|used by worktree) at '([^']+)'", err):
+        return f"la rama {m[1]} ya está abierta en {place(m[2])}"
+    if "would be overwritten by" in err:
+        return "hay cambios sin commitear que se perderían; haz commit o stash antes"
+    if m := re.search(r"pathspec '([^']+)' did not match|invalid reference: (\S+)", err):
+        return f"no existe la rama {m[1] or m[2]}"
+    if re.search(r"Could not resolve host|Failed to connect|Connection (?:refused|timed out)|Operation timed out", err):
+        return "no se pudo conectar con el remoto (¿sin red o sin VPN?)"
+    if re.search(r"Authentication failed|could not read Username|Permission denied \(publickey\)|Access denied", err):
+        return "el remoto ha rechazado las credenciales"
+    return re.sub(r"^(?:fatal|error): ", "", err, flags=re.M)
+
+
+def branch_busy(name: str, branch: str, other: str) -> str:
+    """Rama abierta en otro working tree: que pasa y como seguir."""
+    where = place(other)
+    if where == f"la carpeta original de {name}":
+        way = (f"deja {name} fuera del espacio (sus servicios correrán desde la carpeta original, "
+               f"que ya está en {branch}), ponlo en solo lectura o usa una rama nueva")
+    else:
+        way = f"ponlo en solo lectura, usa una rama nueva o deja {name} fuera del espacio"
+    return f"{name}: la rama {branch} ya está abierta en {where}; {way}"
 
 
 # --- cortar el trabajo en curso ----------------------------------------------
@@ -819,7 +859,8 @@ def do_checkout(name: str, branch: str, base: str | None = None) -> str:
         return branch
     git(p, "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
     if git(p, "status", "--porcelain").strip():
-        raise HTTPException(409, f"{name}: working tree dirty, no se hace checkout")
+        raise HTTPException(409, f"{name} tiene cambios sin commitear en su carpeta original; "
+                                 "haz commit o stash antes de cambiar de rama")
     opts, start = branch_start(p, name, branch, base)
     git(p, "checkout", "-q", *opts, start)
     return branch
@@ -932,18 +973,18 @@ def wt_ensure(name: str, branch: str, profile: str, base: str | None = None) -> 
         cur = git(d, "branch", "--show-current").strip()
         if cur != branch:
             if git(d, "status", "--porcelain").strip():
-                raise HTTPException(409, f"{name}: worktree con cambios locales; resuelve antes de pasar a {branch}")
+                raise HTTPException(409, f"{name}: el worktree (worktrees/{d.name}) tiene cambios sin "
+                                         f"commitear; haz commit o stash antes de pasar a {branch}")
             other = branch_open_at(p, branch, exclude=d)
             if other:
-                raise HTTPException(409, f"{name}: la rama {branch} ya esta abierta en {other}")
+                raise HTTPException(409, branch_busy(name, branch, other))
             opts, start = branch_start(p, name, branch, base)
             git(d, "checkout", "-q", *opts, start)
     else:
         git(p, "worktree", "prune")
         other = branch_open_at(p, branch)
         if other:
-            raise HTTPException(409, f"{name}: la rama {branch} ya esta abierta en {other}; "
-                                     "usa otra rama o cambia la de alli")
+            raise HTTPException(409, branch_busy(name, branch, other))
         opts, start = branch_start(p, name, branch, base)
         git(p, "worktree", "add", "-q", *opts, str(d), start, timeout=300)
     wt_link_github(name, d)
@@ -1681,7 +1722,9 @@ def api_profile_start(name: str, force: bool = False):
               if e and pid_alive(e["pid"]) and sid not in mine]
     if others and not force:
         owner = state.get("active_profile") or others[0].partition("/")[0]
-        raise HTTPException(409, f"esta arrancado {owner}: se parara para arrancar {name}")
+        # la UI reconoce el caso por el codigo, no por el texto
+        raise HTTPException(409, f"está arrancado {owner}: se parará para arrancar {name}",
+                            headers={"X-Devws-Code": "other_space_running"})
     start_job(name, "start")
     return {"ok": True}
 

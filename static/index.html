@@ -247,7 +247,10 @@ const e = new Error(r.status === 404
 : `${r.status} ${text.slice(0, 200)}`);
 e.status = r.status; e.noRoute = r.status === 404; throw e;
 }
-if (!r.ok) { const e = new Error(j.detail || j.msg || JSON.stringify(j)); e.status = r.status; throw e; }
+if (!r.ok) {
+const e = new Error(j.detail || j.msg || JSON.stringify(j));
+e.status = r.status; e.code = r.headers.get("X-Devws-Code"); throw e;
+}
 return j;
 }
 const post = (path, body) => api(path, body === undefined ? { method: "POST" }
@@ -437,8 +440,8 @@ $("#profilesList").innerHTML = list.length ? list.map(profileCard).join("")
 async function startProfile(name) {
 try { await post(`/api/profiles/${enc(name)}/start`); }
 catch (e) {
-// 409 "esta arrancado X": se ofrece cambiar de espacio
-if (e.status !== 409 || !e.message.startsWith("esta arrancado")) return toast(e.message, true);
+// 409 "está arrancado X": se ofrece cambiar de espacio
+if (e.code !== "other_space_running") return toast(e.message, true);
 if (!confirm(`${e.message}.\n\n¿Continuar?`)) return;
 try { await post(`/api/profiles/${enc(name)}/start?force=true`); } catch (e2) { return toast(e2.message, true); }
 }
@@ -676,7 +679,8 @@ sel.value = sel.dataset.current; sel.blur(); return;
 sel.blur();
 try {
 const [it] = await post("/api/checkout", { items: [{ repo: name, branch }] });
-toast(`${it.repo}: ${it.ok ? "ahora en " + it.branch : it.error}`, !it.ok);
+// los errores del servidor ya suelen empezar por el nombre del repo
+toast(it.ok ? `${it.repo}: ahora en ${it.branch}` : it.error.startsWith(it.repo) ? it.error : `${it.repo}: ${it.error}`, !it.ok);
 } catch (e) { toast(e.message, true); }
 refreshRepos(); kick();
 }
