@@ -111,14 +111,55 @@ def service(name: str) -> dict:
     raise HTTPException(404, f"servicio desconocido: {name}")
 
 
-def git(repo_dir: Path, *args: str, timeout: int = 90) -> str:
-    res = subprocess.run(
-        ["git", "-C", str(repo_dir), *args],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    if res.returncode != 0:
-        raise RuntimeError(res.stderr.strip() or res.stdout.strip())
-    return res.stdout
+def git(repo_dir: Path, *args: str, timeout: int = 90, cancellable: bool = False) -> str:
+    """cancellable: si se pide parar el trabajo en curso, se mata git (solo
+    para operaciones que se pueden cortar sin dejar nada a medias: fetch)."""
+    cmd = ["git", "-C", str(repo_dir), *args]
+    if not cancellable:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        rc, out, err = res.returncode, res.stdout, res.stderr
+    else:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        rc, out, err = run_cancellable(proc, timeout)
+    if rc != 0:
+        raise RuntimeError(err.strip() or out.strip())
+    return out
+
+
+# --- cortar el trabajo en curso ----------------------------------------------
+# Solo hay un trabajo (arrancar / preparar / instalar / parar) a la vez, en su
+# hilo. "Parar" lo corta: se marca _job_cancel y el hilo lo nota en el siguiente
+# paso, mata el proceso que este esperando (git fetch, instalador) o deja de
+# esperar a un puerto. Las peticiones normales no se ven afectadas.
+_job_lock = threading.RLock()     # empezar / acabar / cortar trabajos, sin carreras
+_job_cancel = threading.Event()
+_job_thread: threading.Thread | None = None
+_stop_after: str | None = None    # perfil a parar en cuanto se corte el trabajo
+
+
+class JobCancelled(Exception):
+    pass
+
+
+def cancel_requested() -> bool:
+    return _job_cancel.is_set() and threading.current_thread() is _job_thread
+
+
+def run_cancellable(proc: subprocess.Popen, timeout: float) -> tuple[int, str, str]:
+    """Espera a proc; lo mata (con sus hijos) si se corta el trabajo o vence el timeout."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            out, err = proc.communicate(timeout=0.3)
+            return proc.returncode, out or "", err or ""
+        except subprocess.TimeoutExpired:
+            if cancel_requested() or time.time() > deadline:
+                kill_process(proc.pid)
+                proc.communicate()
+                if cancel_requested():
+                    raise JobCancelled()
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+
 
 def tcp_conns() -> list[tuple[int, int, str]]:
     """(puerto local, pid, estado) de los sockets TCP visibles."""
@@ -166,11 +207,15 @@ def pid_alive(pid: int) -> bool:
         return False
 
 
-def wait_port(port: int, timeout: float = 60.0) -> bool:
+def wait_port(port: int, timeout: float = 60.0, proc: subprocess.Popen | None = None) -> bool:
+    """Espera a que el puerto responda. Deja de esperar si el proceso `proc`
+    termina (no va a abrirlo nunca) o si se corta el trabajo en curso."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if port_open(port):
             return True
+        if (proc is not None and proc.poll() is not None) or cancel_requested():
+            return port_open(port)
         time.sleep(0.5)
     return False
 
@@ -713,7 +758,7 @@ def kill_process(pid: int) -> None:
 
 def wait_port_free(port: int, timeout: float = 15.0) -> bool:
     deadline = time.time() + timeout
-    while time.time() < deadline:
+    while time.time() < deadline and not cancel_requested():
         if not port_open(port):
             return True
         time.sleep(0.5)
@@ -769,7 +814,7 @@ def do_checkout(name: str, branch: str, base: str | None = None) -> str:
     current = git(p, "branch", "--show-current").strip()
     if current == branch:
         return branch
-    git(p, "fetch", "--prune", "--quiet", timeout=120)
+    git(p, "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
     if git(p, "status", "--porcelain").strip():
         raise HTTPException(409, f"{name}: working tree dirty, no se hace checkout")
     opts, start = branch_start(p, name, branch, base)
@@ -839,7 +884,7 @@ def wt_ensure(name: str, branch: str, profile: str, base: str | None = None) -> 
     misma rama en dos sitios y forzarlo (--force) acaba en lios."""
     p = repo_path(name)
     d = wt_dir_for(profile, name)
-    git(p, "fetch", "--prune", "--quiet", timeout=120)
+    git(p, "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
     if d.exists():
         cur = git(d, "branch", "--show-current").strip()
         if cur != branch:
@@ -1010,9 +1055,11 @@ def _start_service(svc: dict, port: int, killed: list,
             entry["wt"] = wt_dir.name
         with state_tx() as st:
             st["services"][name] = entry
-        if wait_port(port, timeout=90):
+        if wait_port(port, timeout=90, proc=proc):
             extra = f" (matado {len(killed)} proceso(s) previo(s))" if killed else ""
             return {"ok": True, "msg": f"up en :{port}{extra}", "pid": proc.pid}
+        if cancel_requested():
+            raise JobCancelled()  # el proceso queda en state: el "parar" que sigue lo mata
         tail = log_tail(name)
         exclude.add(proc.pid)
         if attempt == 1 and any(m in tail for m in ADDR_IN_USE):
@@ -1021,6 +1068,9 @@ def _start_service(svc: dict, port: int, killed: list,
                 kill_process(pid)
             time.sleep(1)
             continue
+        if proc.poll() is not None:
+            return {"ok": True, "warn": f"el proceso termino (codigo {proc.returncode}) sin abrir "
+                    f"el puerto {port}; revisa el log"}
         return {"ok": True, "warn": f"proceso lanzado (pid {proc.pid}) pero el puerto {port} "
                 "no respondio a tiempo; revisa el log"}
     return {"ok": True, "warn": f"el puerto {port} sigue sin responder; revisa el log"}
@@ -1318,21 +1368,25 @@ def _set_job(profile: str, **info) -> None:
 class Job:
     """Contexto de un trabajo: anota pasos en state y en el log de actividad."""
 
-    def __init__(self, profile: str, action: str):
+    def __init__(self, profile: str, action: str, append: bool = False):
         self.profile, self.action = profile, action
         LOGS_DIR.mkdir(exist_ok=True)
         self.log = job_log(profile)
-        self.log.write_text(f"=== {action} {profile} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+        with open(self.log, "a" if append else "w") as fh:
+            fh.write(f"=== {action} {profile} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
     def step(self, msg: str) -> None:
+        if cancel_requested():
+            raise JobCancelled()
         _set_job(self.profile, action=self.action, status="running", step=msg)
         with open(self.log, "a") as fh:
             fh.write(f"\n--- {time.strftime('%H:%M:%S')} {msg}\n")
 
     def run(self, cmd: list[str], cwd: Path, timeout: int) -> int:
         with open(self.log, "ab") as fh:
-            return subprocess.run([shutil.which(cmd[0]) or cmd[0], *cmd[1:]], cwd=cwd,
-                                  stdout=fh, stderr=subprocess.STDOUT, timeout=timeout).returncode
+            proc = subprocess.Popen([shutil.which(cmd[0]) or cmd[0], *cmd[1:]], cwd=cwd,
+                                    stdout=fh, stderr=subprocess.STDOUT)
+            return run_cancellable(proc, timeout)[0]
 
 
 def deps_install(job: Job, rname: str, d: Path) -> None:
@@ -1433,14 +1487,16 @@ def job_start(job: Job, prof: dict, services_too: bool = True) -> list[str]:
     if not services_too:
         return []
     errors = []
+    # activo desde ya (no al acabar): si se corta a medias, parar sabe que
+    # servicios son suyos (en in-place no se distinguen de los sueltos)
+    with state_tx() as st:
+        st["active_profile"] = job.profile
     svcs = profile_services(prof)
     for i, s in enumerate(svcs, 1):
         job.step(f"arrancando {s} ({i}/{len(svcs)})")
         r = api_up(f"{job.profile}/{s}" if is_wt else s, force=True)
         if not r.get("ok") or r.get("warn"):
             errors.append(f"{s}: {r.get('warn') or r.get('msg')}")
-    with state_tx() as st:
-        st["active_profile"] = job.profile
     return errors
 
 
@@ -1457,31 +1513,73 @@ def job_stop(job: Job, prof: dict) -> None:
             st["active_profile"] = None
 
 
-def run_job(profile: str, action: str) -> None:
-    job = Job(profile, action)
+def run_job(profile: str, action: str, append: bool = False) -> None:
+    global _stop_after
+    job = Job(profile, action, append)
     prof = load_profile(profile) or {}
-    errors = []
+    errors, cancelled = [], False
     try:
         if action == "stop":
             job_stop(job, prof)
         else:
             errors = job_start(job, prof, services_too=(action == "start"))
+    except JobCancelled:
+        cancelled = True
     except Exception as e:  # hilo en segundo plano: el error tiene que llegar a la UI
         errors.append(str(e.detail) if isinstance(e, HTTPException) else str(e))
     with open(job.log, "a") as fh:
-        fh.write("\n=== " + ("ERROR: " + "; ".join(errors) if errors else "listo") + " ===\n")
-    _set_job(profile, action=action, status="error" if errors else "ok",
-             error="; ".join(errors) or None)
+        end = "cortado para parar" if cancelled else ("ERROR: " + "; ".join(errors) if errors else "listo")
+        fh.write(f"\n=== {end} ===\n")
+    with _job_lock:
+        nxt, _stop_after = _stop_after, None
+        _set_job(profile, action=action, status="cancelled" if cancelled else "error" if errors else "ok",
+                 error="; ".join(errors) or None)
+        if nxt:  # se pidio parar mientras trabajaba: ahora toca parar
+            _set_job(nxt, action="stop", status="running", step="parando…")
+            _launch_job(nxt, "stop", append=True)
+
+
+def _launch_job(profile: str, action: str, append: bool = False) -> None:
+    global _job_thread
+    _job_cancel.clear()
+    _job_thread = threading.Thread(target=run_job, args=(profile, action, append), daemon=True)
+    _job_thread.start()
+
+
+def _busy_job() -> tuple[str, dict] | None:
+    return next(((p, j) for p, j in load_state().get("jobs", {}).items()
+                 if j.get("status") == "running"), None)
 
 
 def start_job(profile: str, action: str) -> None:
-    with state_tx() as st:
-        busy = [p for p, j in st.get("jobs", {}).items() if j.get("status") == "running"]
+    with _job_lock:
+        busy = _busy_job()
         if busy:
             raise HTTPException(409, f"espera: {busy[0]} todavia esta trabajando")
-        st.setdefault("jobs", {})[profile] = {"action": action, "status": "running",
-                                              "step": "parando…" if action == "stop" else "empezando…"}
-    threading.Thread(target=run_job, args=(profile, action), daemon=True).start()
+        _set_job(profile, action=action, status="running",
+                 step="parando…" if action == "stop" else "empezando…")
+        _launch_job(profile, action)
+
+
+def request_stop(profile: str) -> None:
+    """Parar se puede pedir siempre: si hay un trabajo en marcha (arrancar,
+    preparar, instalar) se corta y, en cuanto lo nota, se para `profile`."""
+    global _stop_after
+    with _job_lock:
+        busy = _busy_job()
+        if not busy:
+            return start_job(profile, "stop")
+        other, job = busy
+        if job.get("action") == "stop" or _stop_after:
+            if (_stop_after or other) == profile:
+                return  # ya se esta parando
+            raise HTTPException(409, f"espera: {other} todavia se esta parando")
+        _stop_after = profile
+        _job_cancel.set()
+        _set_job(other, action=job.get("action"), status="running", step="cortando para parar…")
+        if other != profile:
+            _set_job(profile, action="stop", status="running",
+                     step=f"esperando a que se corte el trabajo de {other}…")
 
 
 def reset_interrupted_jobs() -> None:
@@ -1520,8 +1618,9 @@ def api_profile_start(name: str, force: bool = False):
 
 @app.post("/api/profiles/{name}/stop")
 def api_profile_stop(name: str):
+    """Para el espacio; si hay un trabajo en marcha lo corta antes."""
     _profile_or_404(name)
-    start_job(name, "stop")
+    request_stop(name)
     return {"ok": True}
 
 

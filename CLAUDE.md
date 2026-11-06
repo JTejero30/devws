@@ -66,6 +66,8 @@ node/npm y uv en el PATH. Todo cambio va con su test.
 - Dependencias de un worktree: solo al arrancarlo o con "instalar", y solo si
   cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`).
 - `git fetch --prune` solo al hacer checkout o crear worktree.
+- Un trabajo (arrancar/preparar/instalar/parar) a la vez, salvo Parar: corta el
+  trabajo en curso (mata fetch o instalador, deja de esperar puertos) y despues para.
 
 ## Sin probar en macOS
 

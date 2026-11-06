@@ -829,3 +829,80 @@ def test_logs_incrementales_y_escritura(ws):
     r = q(offset=10 ** 9, gen=r["gen"])
     assert r["reset"] and r["lines"][-1] == "corta"
     f.unlink()
+
+
+def pid_dead(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    # zombi (hijo del server sin recoger): cuenta como muerto
+    stat = Path(f"/proc/{pid}/stat")
+    return stat.exists() and stat.read_text().split(")")[-1].split()[0] == "Z"
+
+
+def test_parar_corta_el_arranque_mientras_instala(ws):
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    cfg = dws / "config.toml"
+    before = cfg.read_text()
+    pidf = root / "instalador.pid"
+    inst = [sys.executable, "-c",
+            f"import os, time; open({str(pidf)!r}, 'w').write(str(os.getpid())); time.sleep(120)"]
+    c.post("/api/repos", {"name": "lento", "path": str(root / "lib"), "install": inst, "library": []})
+    c.post("/api/profiles", {"name": "corta", "repos": {"lento": "corta-x"}, "bases": {"lento": "main"},
+                             "services": ["api"], "worktree": True})
+    c.post("/api/profiles/corta/start")
+    wait_for(lambda: pidf.exists() and pidf.read_text(), 60, "instalador en marcha")
+    pid = int(pidf.read_text())
+    t0 = time.time()
+    c.post("/api/profiles/corta/stop")
+    j = wait_job(c, "corta")
+    assert j["action"] == "stop" and time.time() - t0 < 30, "parar no espera a que acabe la instalacion"
+    wait_for(lambda: pid_dead(pid), 10, "instalador muerto")
+    assert svc(c, "api")["status"] == "down", "no siguio arrancando servicios"
+    log = c.get("/api/logs/corta--actividad")["lines"]
+    assert any("cortado para parar" in l for l in log) and any("=== stop corta" in l for l in log)
+    # cortado a medias: se puede volver a trabajar con el espacio
+    c.delete("/api/worktrees/corta?force=true")
+    c.delete("/api/profiles/corta")
+    c.delete("/api/repos/lento")
+    assert tomllib.loads(cfg.read_text()) == tomllib.loads(before)
+
+
+def test_parar_mientras_un_servicio_espera_su_puerto(ws):
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    cfg = dws / "config.toml"
+    before = cfg.read_text()
+    port = free_port()
+    c.post("/api/repos", {"name": "colgado", "path": str(root / "api"), "service": {
+        "name": "colgado", "port": port, "cmd": [sys.executable, "-c", "import time; time.sleep(600)"]}})
+    c.post("/api/profiles", {"name": "cuelga", "repos": {}, "services": ["colgado"], "worktree": False})
+    c.post("/api/profiles/cuelga/start")
+    s = wait_for(lambda: (s := svc(c, "colgado"))["status"] == "starting" and s, 30, "colgado arrancando")
+    # mientras arranca, otro trabajo no puede empezar, pero parar si
+    st, out = c.post("/api/profiles/cuelga/start?force=true", ok=False)
+    assert st == 409 and "espera" in out["detail"]
+    t0 = time.time()
+    c.post("/api/profiles/cuelga/stop")
+    wait_job(c, "cuelga")
+    assert time.time() - t0 < 30, "no espera los 90 s del puerto"
+    assert svc(c, "colgado")["status"] == "down"
+    wait_for(lambda: pid_dead(s["pid"]), 10, "proceso colgado muerto")
+    c.delete("/api/profiles/cuelga")
+    c.delete("/api/repos/colgado")
+    assert tomllib.loads(cfg.read_text()) == tomllib.loads(before)
+
+
+def test_servicio_que_muere_al_arrancar_no_hace_esperar(ws):
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    cfg = dws / "config.toml"
+    before = cfg.read_text()
+    c.post("/api/repos", {"name": "muere", "path": str(root / "api"), "service": {
+        "name": "muere", "port": free_port(), "cmd": [sys.executable, "-c", "import sys; sys.exit(3)"]}})
+    t0 = time.time()
+    r = c.post("/api/services/muere/up")
+    assert time.time() - t0 < 20 and "termino (codigo 3)" in r["warn"], r
+    c.delete("/api/repos/muere")
+    assert tomllib.loads(cfg.read_text()) == tomllib.loads(before)
