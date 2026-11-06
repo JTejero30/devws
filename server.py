@@ -1118,6 +1118,20 @@ def log_tail(svc_id: str, chars: int = 4000) -> str:
     return f.read_bytes()[-chars:].decode(errors="replace")
 
 
+def last_log_line(svc_id: str) -> str:
+    """Ultima linea con texto del log (sin colores ANSI): suele decir por que cayo."""
+    lines = [l for l in re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", log_tail(svc_id, 2000)).splitlines() if l.strip()]
+    return lines[-1].strip()[:300] if lines else ""
+
+
+def drop_dead(mine=lambda sid: True) -> None:
+    """Olvida los servicios caidos (pid muerto) que cumplan `mine`: al arrancar o
+    parar su espacio dejan de mostrarse como caidos."""
+    with state_tx() as st:
+        for sid in [s for s, e in st["services"].items() if mine(s) and not (e and pid_alive(e["pid"]))]:
+            del st["services"][sid]
+
+
 def stray_pids(repo_name: str, exclude: set[int], wt_dir: Path | None = None) -> list[int]:
     needle = str(wt_dir) if wt_dir else repo_name
     out = []
@@ -1209,18 +1223,29 @@ def service_status(name: str, svc: dict, state: dict, conns: list | None = None)
     port = svc["port"]
     _, _, _, p, wt_dir = _svc_ctx(name)
     pids = port_pids(port, conns)
-    if entry and pid_alive(entry["pid"]) and pids:
+    alive = bool(entry) and pid_alive(entry["pid"])
+    owner = None
+    if alive and pids:
         status = "up"
-    elif entry and pid_alive(entry["pid"]):
+    elif alive:
         status = "starting"
+    elif entry:
+        status = "crashed"  # lo arranco devws y su proceso ya no vive (nadie lo paro)
     elif pids:
-        status = "external"
+        # el puerto lo tiene otro servicio de devws (de otro espacio) o algo de fuera
+        owner = next((sid for sid, e in state["services"].items()
+                      if sid != name and e and e.get("port") == port and pid_alive(e["pid"])), None)
+        status = "other_space" if owner else "external"
     else:
         status = "down"
     out = {"id": name, "name": svc["name"], "repo": svc["repo"], "port": port,
            "status": status, "pid": entry["pid"] if entry else None,
            "branch": entry.get("branch") if entry else None,
            "port_pids": pids}
+    if owner:
+        out["owner"] = owner.partition("/")[0] if "/" in owner else state.get("active_profile")
+    if status == "crashed":
+        out["last_line"] = last_log_line(name)
     if prof:
         out["wt"] = True
         out["profile"] = prof
@@ -1614,6 +1639,7 @@ def job_checkout(job: Job, prof: dict) -> None:
 def job_start(job: Job, prof: dict, services_too: bool = True) -> list[str]:
     is_wt = bool(prof.get("worktree"))
     if services_too:
+        drop_dead()  # arranque limpio: los caidos de antes (de cualquier espacio) se olvidan
         # regla de oro: un solo espacio arrancado; se para todo lo que corra
         running = [sid for sid, e in load_state()["services"].items() if e and pid_alive(e["pid"])]
         for sid in reversed(running):
@@ -1647,6 +1673,7 @@ def job_stop(job: Job, prof: dict) -> None:
     for sid in ids:
         job.step(f"parando {sid.split('/')[-1]}")
         api_down(sid)
+    drop_dead((lambda sid: sid.startswith(f"{job.profile}/")) if prof.get("worktree") else (lambda sid: "/" not in sid))
     with state_tx() as st:
         if st.get("active_profile") == job.profile:
             st["active_profile"] = None
@@ -1996,6 +2023,9 @@ Reglas:
 - Arrancar un espacio para otro que este corriendo (force) y borrar un espacio
   (devws_remove_workspace) solo con confirmacion explicita del usuario.
 - Commits y push los hace el agente con git dentro de cada worktree, como siempre.
+- Estado de un servicio: up, starting, down, crashed (devws lo arranco y su
+  proceso murio: mira su log), other_space (su puerto lo usa el servicio de otro
+  espacio, en owner) o external (lo usa algo que no es de devws).
 
 Anadir un repo o configurar su arranque (devws_add_repo, devws_configure_startup):
 - En devws_status, un repo con startup=null no se puede arrancar: si la tarea lo

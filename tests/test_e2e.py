@@ -9,6 +9,7 @@ Ejecutar: uv run pytest -v
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -545,6 +546,28 @@ def test_repos_dicen_donde_esta_abierta_cada_rama(ws):
         (root / "api" / "sucio.txt").unlink()
     c.delete("/api/worktrees/abiertas?force=true")
     c.delete("/api/profiles/abiertas")
+
+
+def test_servicio_caido_y_puerto_en_uso_por_otro_espacio(ws):
+    c = ws["c"]
+    c.post("/api/profiles", {"name": "vecino", "repos": {"worker": "feat-a"}, "services": ["api"], "worktree": True})
+    prepare(c, "vecino")
+    c.post("/api/profiles", {"name": "caida", "repos": {}, "services": ["api"], "worktree": False})
+    c.post("/api/profiles/caida/start")
+    wait_job(c, "caida")
+    s = svc(c, "vecino/api")
+    assert s["status"] == "other_space" and s["owner"] == "caida", "no es algo de fuera: es otro espacio"
+
+    os.kill(svc(c, "api")["pid"], signal.SIGKILL)
+    s = wait_for(lambda: (s := svc(c, "api"))["status"] == "crashed" and s, 15, "api caido")
+    assert "last_line" in s, "se ve por que cayo"
+    assert svc(c, "vecino/api")["status"] == "down"
+    c.post("/api/profiles/caida/stop")
+    wait_job(c, "caida")
+    assert svc(c, "api")["status"] == "down", "parar el espacio olvida sus caidos"
+    c.delete("/api/worktrees/vecino")
+    for p in ("vecino", "caida"):
+        c.delete(f"/api/profiles/{p}")
 
 
 def mcp_rpc(c: Client, method: str, params: dict | None = None) -> dict:
