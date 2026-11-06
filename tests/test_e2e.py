@@ -502,6 +502,197 @@ def test_rama_local_desfasada_se_pone_al_dia_con_origin(ws):
         sh(web, "git", "branch", "-q", "-D", "ff-x")
 
 
+def cleanup_of(c: Client, name: str) -> dict:
+    return c.get("/api/cleanup")["spaces"][name]
+
+
+def tags_of(c: Client, name: str, repo: str) -> list[str]:
+    e = next(e for e in cleanup_of(c, name)["repos"] if e["repo"] == repo)
+    return [t for _, t in e["health"]["tags"]]
+
+
+def other_clone(root: Path, repo: str, name: str) -> Path:
+    """Otra copia del remoto del repo: lo que hacen otros (o GitLab) en origin."""
+    d = root / name
+    sh(root, "git", "clone", "-q", str(root / "_remotes" / f"{repo}.git"), str(d))
+    sh(d, "git", "config", "user.email", "test@devws")
+    sh(d, "git", "config", "user.name", "test")
+    return d
+
+
+def squash_into_main(other: Path, branch: str) -> None:
+    sh(other, "git", "checkout", "-q", "main")
+    sh(other, "git", "pull", "-q", "origin", "main")
+    sh(other, "git", "fetch", "-q", "origin")
+    sh(other, "git", "merge", "-q", "--squash", f"origin/{branch}")
+    sh(other, "git", "commit", "-q", "-m", f"squash {branch}")
+    sh(other, "git", "push", "-q", "origin", "main")
+
+
+def commit_in(d: Path, msg: str) -> None:
+    (d / f"{msg}.txt").write_text(msg)
+    sh(d, "git", "add", ".")
+    sh(d, "git", "commit", "-q", "-m", msg)
+
+
+def age_space(dws: Path, name: str, days: int) -> None:
+    """Como si el espacio llevara `days` dias sin tocarse (servidor en reposo)."""
+    old = time.time() - days * 86400
+    st_file = dws / "state.json"
+    st = json.loads(st_file.read_text())
+    st.setdefault("used", {})[name] = old
+    st_file.write_text(json.dumps(st))
+    prof = dws / "profiles" / f"{name}.toml"
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(old))
+    prof.write_text(re.sub(r'created_at = "[^"]*"', f'created_at = "{stamp}"', prof.read_text()))
+    for d in (dws / "worktrees").glob(f"{name}__*"):
+        gitdir = d / (d / ".git").read_text().split("gitdir:", 1)[1].strip()
+        for f in [gitdir / "logs" / "HEAD", *(f for f in d.rglob("*") if ".git" not in f.parts)]:
+            if f.exists() and not f.is_symlink():
+                os.utime(f, (old, old))
+
+
+def test_limpieza_estado_de_las_ramas_y_veredicto(ws):
+    """Por repo: sin commits propios, nunca subida, sin subir, stash, sin
+    mergear, mergeada con squash y borrada en origin. Y el veredicto del espacio:
+    en uso, revisar (viejo con trabajo sin mergear) o se puede borrar."""
+    c, dws, root = ws["c"], ws["dws"], ws["root"]
+    other = other_clone(root, "commons_worker", "_clone_lmp")
+    c.post("/api/profiles", {"name": "lmp", "repos": {"worker": "lmp-x"}, "bases": {"worker": "main"},
+                             "worktree": True})
+    prepare(c, "lmp")
+    d = dws / "worktrees" / "lmp__worker"
+    assert tags_of(c, "lmp", "worker") == ["sin commits propios"]
+    s = cleanup_of(c, "lmp")
+    assert s["verdict"] == "en_uso" and s["idle_days"] == 0 and s["reasons"] == [], s
+
+    commit_in(d, "uno")
+    assert tags_of(c, "lmp", "worker") == ["nunca subida · 1 commit"]
+    sh(d, "git", "push", "-q", "-u", "origin", "lmp-x")
+    assert tags_of(c, "lmp", "worker") == ["sin mergear en main"]
+    commit_in(d, "dos")
+    (d / "a-medias.txt").write_text("x")
+    sh(d, "git", "stash", "-q", "-u")
+    assert tags_of(c, "lmp", "worker") == ["1 commit sin subir", "1 stash"]
+    s = cleanup_of(c, "lmp")
+    assert s["verdict"] == "en_uso" and "worker: 1 commit sin subir" in s["reasons"], s
+    age_space(dws, "lmp", 10)
+    s = cleanup_of(c, "lmp")
+    assert s["verdict"] == "revisar" and s["idle_days"] == 10, s
+    assert s["reasons"][0] == "sin uso desde hace 10 días" and "worker: 1 stash" in s["reasons"], s
+    sh(d, "git", "stash", "drop", "-q")
+    sh(d, "git", "push", "-q")
+
+    squash_into_main(other, "lmp-x")
+    assert tags_of(c, "lmp", "worker") == ["sin mergear en main"], "sin traer lo de origin aun no se sabe"
+    c.post("/api/cleanup/fetch")
+    wait_job(c, "__origin")
+    rep = c.get("/api/cleanup")
+    assert rep["fetch_job"]["status"] == "ok" and time.time() - rep["fetched"]["at"] < 60, rep
+    assert tags_of(c, "lmp", "worker") == ["mergeada en main"]
+    s = rep["spaces"]["lmp"]
+    assert s["verdict"] == "borrable" and s["reasons"][0] == "worker: mergeada en main", s
+
+    # GitLab borra la rama al mergear y se sigue trabajando en ella sin subir
+    sh(other, "git", "push", "-q", "origin", "--delete", "lmp-x")
+    c.post("/api/cleanup/fetch")
+    wait_job(c, "__origin")
+    assert tags_of(c, "lmp", "worker") == ["mergeada en main"], "borrada pero mergeada: nada que avisar"
+    commit_in(d, "tres")
+    assert tags_of(c, "lmp", "worker") == ["borrada en origin · sin mergear"]
+
+    # un espacio sin trabajo propio: en uso los primeros dias, luego se puede borrar
+    c.post("/api/profiles", {"name": "lmp2", "repos": {"web": "lmp2-x"}, "bases": {"web": "main"},
+                             "worktree": True})
+    prepare(c, "lmp2")
+    assert cleanup_of(c, "lmp2")["verdict"] == "en_uso"
+    age_space(dws, "lmp2", 8)
+    s = cleanup_of(c, "lmp2")
+    assert s["verdict"] == "borrable" and s["reasons"][0] == "sin uso desde hace 8 días", s
+
+    for name in ("lmp", "lmp2"):
+        c.delete(f"/api/worktrees/{name}?force=true")
+        c.delete(f"/api/profiles/{name}")
+    sh(root / "commons" / "worker", "git", "branch", "-q", "-D", "lmp-x")
+    sh(root / "web", "git", "branch", "-q", "-D", "lmp2-x")
+
+
+def test_eliminar_espacio_borra_sus_ramas_y_nada_mas(ws):
+    """Al eliminar un espacio se borran las ramas que devws creo para el: la
+    local si no se pierde nada y la de origin si la creo el y esta mergeada.
+    Nunca una protegida, ni la de otro espacio, ni la de origin que ya existia,
+    ni lo que no se confirmo."""
+    c, dws, root = ws["c"], ws["dws"], ws["root"]
+    worker, api, web, lib = root / "commons" / "worker", root / "api", root / "web", root / "lib"
+    other = other_clone(root, "commons_worker", "_clone_brr")
+    repos = {"worker": "brr-y", "api": "feat-a", "web": "desa", "lib": "brr-wip"}
+    bases = {"worker": "main", "web": "main", "lib": "main"}
+    c.post("/api/profiles", {"name": "brr", "repos": repos, "bases": bases, "worktree": True})
+    prepare(c, "brr")
+    # el espacio pasa worker a otra rama: las dos son suyas
+    c.put("/api/profiles", {"name": "brr", "repos": {**repos, "worker": "brr-x"}, "bases": bases,
+                            "worktree": True})
+    prepare(c, "brr")
+    c.post("/api/profiles", {"name": "brr-otro", "repos": {"worker": "brr-y"}})
+    wd = dws / "worktrees" / "brr__worker"
+    commit_in(wd, "x")
+    sh(wd, "git", "push", "-q", "-u", "origin", "brr-x")
+    squash_into_main(other, "brr-x")
+    commit_in(dws / "worktrees" / "brr__lib", "wip")
+    (dws / "logs" / "brr--worker.log").write_text("log\n")
+
+    plan = c.post("/api/cleanup/plan", {"spaces": ["brr"]})
+    assert plan["offline"] == [] and len(plan["targets"]) == 1
+    t = plan["targets"][0]
+    assert sorted(x["repo"] for x in t["dirs"]) == ["api", "lib", "web", "worker"]
+    got = {(e["repo"], e["branch"]): (e["local"], e["remote"], e["keep_local"], e["keep_remote"])
+           for e in t["branches"]}
+    assert got == {
+        ("worker", "brr-x"): (True, True, None, None),
+        ("worker", "brr-y"): (False, False, "la usa el espacio brr-otro", None),
+        ("api", "feat-a"): (True, False, None, None),  # su origin/feat-a ya existia: no es del espacio
+        ("web", "desa"): (False, False, "rama protegida", None),
+        ("lib", "brr-wip"): (False, False, "1 commit que solo está en local", None),
+    }, got
+
+    # se confirma todo lo que el plan borra menos la de api
+    confirmed = [{"repo": e["repo"], "branch": e["branch"], "local": e["local"], "remote": e["remote"]}
+                 for e in t["branches"] if e["repo"] != "api"]
+    r = c.post("/api/cleanup/remove", {"spaces": ["brr"], "branches": confirmed})
+    assert r["ok"] and sorted(r["deleted"]) == ["brr-x (worker)", "origin/brr-x (worker)"], r
+    assert {"feat-a (api)", "brr-y (worker): la usa el espacio brr-otro", "desa (web): rama protegida",
+            "brr-wip (lib): 1 commit que solo está en local"} <= set(r["kept"]), r
+    assert "brr" not in c.get("/api/profiles") and not list((dws / "worktrees").glob("brr__*"))
+    assert not (dws / "logs" / "brr--worker.log").exists()
+    assert "brr" not in json.loads((dws / "state.json").read_text()).get("branches", {})
+    assert git_out(worker, "branch", "--list", "brr-x") == ""
+    assert git_out(worker, "ls-remote", "--heads", "origin", "brr-x") == ""
+    assert git_out(api, "ls-remote", "--heads", "origin", "feat-a") != "", "la de origin ya existia"
+    assert git_out(api, "branch", "--list", "feat-a") != "", "no confirmada: se conserva"
+    for d, b in ((worker, "brr-y"), (web, "desa"), (lib, "brr-wip")):
+        assert git_out(d, "branch", "--list", b) != "", b
+        sh(d, "git", "branch", "-q", "-D", b)
+    c.delete("/api/profiles/brr-otro")
+
+    # worktree suelto (repo quitado de un espacio): se borra con su rama
+    c.post("/api/profiles", {"name": "brr2", "repos": {"lib": "brr2-x", "web": "brr2-x"},
+                             "bases": {"lib": "main", "web": "main"}, "worktree": True})
+    prepare(c, "brr2")
+    c.put("/api/profiles", {"name": "brr2", "repos": {"web": "brr2-x"}, "bases": {"web": "main"},
+                            "worktree": True})
+    assert [o["dir"] for o in c.get("/api/cleanup")["orphans"]] == ["brr2__lib"]
+    t = c.post("/api/cleanup/plan", {"orphans": ["brr2__lib"]})["targets"][0]
+    assert [(e["branch"], e["local"]) for e in t["branches"]] == [("brr2-x", True)], t
+    r = c.post("/api/cleanup/remove", {"orphans": ["brr2__lib"], "branches": [
+        {"repo": "lib", "branch": "brr2-x", "local": True}]})
+    assert r["deleted"] == ["brr2-x (lib)"], r
+    assert git_out(lib, "branch", "--list", "brr2-x") == ""
+    assert c.get("/api/cleanup")["orphans"] == []
+    r = c.post("/api/cleanup/remove", {"spaces": ["brr2"], "branches": [
+        {"repo": "web", "branch": "brr2-x", "local": True}]})
+    assert r["deleted"] == ["brr2-x (web)"], r
+
+
 def test_editar_perfil_y_sincronizar(ws):
     c, dws = ws["c"], ws["dws"]
     body = {"name": "sync", "repos": {"api": "feat-a"}, "services": ["api"], "worktree": True}
@@ -724,10 +915,17 @@ def test_mcp_crea_amplia_y_borra_un_espacio(ws):
     (dws / "worktrees" / "mcp1__api" / "sucio.txt").write_text("x")
     err, msg = mcp_tool(c, "devws_remove_workspace", name="mcp1")
     assert err and "sin commitear" in msg
+    err, st = mcp_tool(c, "devws_status")
+    mcp1 = next(s for s in st["spaces"] if s["name"] == "mcp1")
+    assert mcp1["cleanup"]["verdict"] == "en_uso" and mcp1["cleanup"]["idle_days"] == 0, mcp1
     err, r = mcp_tool(c, "devws_remove_workspace", name="mcp1", force=True)
     assert not err and r["ok"], r
     assert not (dws / "worktrees" / "mcp1__api").exists()
     assert "mcp1" not in c.get("/api/profiles")
+    # sus ramas locales se borran (nada se pierde); la de origin ya existia: se queda
+    assert sorted(r["deleted"]) == ["feat-a (api)", "mcp-nueva (worker)"], r
+    assert git_out(ws["root"] / "commons" / "worker", "branch", "--list", "mcp-nueva") == ""
+    assert git_out(ws["root"] / "api", "ls-remote", "--heads", "origin", "feat-a") != ""
 
 
 def test_anadir_repo_con_path_absoluto(ws):

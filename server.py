@@ -1049,6 +1049,8 @@ def wt_ensure(name: str, branch: str, profile: str, base: str | None = None) -> 
                 raise HTTPException(409, branch_busy(name, branch, other))
             opts, start, warn = branch_start(p, name, branch, base)
             git(d, "checkout", "-q", *opts, start)
+            if opts:
+                note_branch(profile, name, branch, new=opts[0] == "--no-track")
     else:
         git(p, "worktree", "prune")
         other = branch_open_at(p, branch)
@@ -1056,6 +1058,8 @@ def wt_ensure(name: str, branch: str, profile: str, base: str | None = None) -> 
             raise HTTPException(409, branch_busy(name, branch, other))
         opts, start, warn = branch_start(p, name, branch, base)
         git(p, "worktree", "add", "-q", *opts, str(d), start, timeout=300)
+        if opts:
+            note_branch(profile, name, branch, new=opts[0] == "--no-track")
     wt_link_github(name, d)
     wt_copy_ignored(name, d)
     return warn
@@ -1461,6 +1465,7 @@ def api_profiles_save(req: ProfileIn):
     if f.exists():
         raise HTTPException(409, f"el perfil {req.name} ya existe; usa PUT para actualizarlo")
     f.write_text(profile_body(req))
+    note_used(req.name)
     return {"ok": True}
 
 
@@ -1471,6 +1476,7 @@ def api_profiles_update(req: ProfileIn):
     if old is None:
         raise HTTPException(404, f"perfil no existe: {req.name}")
     profile_file(req.name).write_text(profile_body(req, old.get("created_at")))
+    note_used(req.name)
     return {"ok": True}
 
 
@@ -1479,10 +1485,14 @@ def api_profiles_delete(name: str):
     f = profile_file(check_name(name, "perfil"))
     if f.exists():
         f.unlink()
+    orphans_left = WT_DIR.exists() and any(WT_DIR.glob(f"{name}__*"))
     with state_tx() as st:
         if st.get("active_profile") == name:
             st["active_profile"] = None
         st.get("jobs", {}).pop(name, None)
+        st.get("used", {}).pop(name, None)
+        if not orphans_left:  # sin carpetas suyas, sus ramas apuntadas ya no son de nadie
+            st.get("branches", {}).pop(name, None)
     return {"ok": True}
 
 
@@ -1537,10 +1547,22 @@ def wt_pending(profile: str) -> list[str]:
     return out
 
 
+def wt_changes(d: Path) -> list[str]:
+    """Rutas con cambios sin commitear (incluye no versionados no ignorados)."""
+    paths, skip = [], False
+    for e in git(d, "status", "--porcelain", "-z").split("\0"):
+        if skip or not e:
+            skip = False
+            continue
+        paths.append(e[3:])
+        skip = e[0] in "RC"  # renombrado o copiado: le sigue la ruta de origen
+    return paths
+
+
 def wt_dirty(d: Path) -> int:
     """Ficheros con cambios sin commitear (incluye no versionados no ignorados)."""
     try:
-        return len(git(d, "status", "--porcelain").splitlines())
+        return len(wt_changes(d))
     except RuntimeError:
         return 0
 
@@ -1738,6 +1760,8 @@ def run_job(profile: str, action: str, append: bool = False) -> None:
     try:
         if action == "stop":
             job_stop(job, prof)
+        elif action == "fetch":
+            errors = job_fetch(job)
         else:
             errors = job_start(job, prof, services_too=(action == "start"))
     except JobCancelled:
@@ -1751,6 +1775,8 @@ def run_job(profile: str, action: str, append: bool = False) -> None:
         nxt, _stop_after = _stop_after, None
         _set_job(profile, action=action, status="cancelled" if cancelled else "error" if errors else "ok",
                  error="; ".join(errors) or None, finished=time.strftime("%H:%M"))
+        if profile != FETCH_JOB:
+            note_used(profile)
         if nxt:  # se pidio parar mientras trabajaba: ahora toca parar
             _set_job(nxt, action="stop", status="running", step="parando…")
             _launch_job(nxt, "stop", append=True)
@@ -1772,7 +1798,7 @@ def start_job(profile: str, action: str) -> None:
     with _job_lock:
         busy = _busy_job()
         if busy:
-            raise HTTPException(409, f"espera: {busy[0]} todavia esta trabajando")
+            raise HTTPException(409, f"espera: {job_who(busy[0])} todavia esta trabajando")
         _set_job(profile, action=action, status="running",
                  step="parando…" if action == "stop" else "empezando…")
         _launch_job(profile, action)
@@ -2038,6 +2064,527 @@ def api_wt_remove(name: str, force: bool = False):
     return {"ok": True, "errors": errs}
 
 
+# --- limpieza: que espacios sobran -----------------------------------------------
+# Por espacio: cuando se uso por ultima vez y, por repo, si su rama tiene trabajo
+# que solo esta en local, si ya esta en su destino (merge, squash o rebase) o si
+# se borro en origin. Con eso, un veredicto: se puede borrar, revisar o en uso.
+# Al eliminar un espacio se borran tambien las ramas que devws creo para el: la
+# local si no se pierde nada y la de origin si la creo el espacio y ya esta
+# mergeada. Nunca una rama protegida, ni la de otro espacio, ni una abierta.
+
+STALE_DAYS = 7  # dias sin tocar un espacio para avisar
+PROTECTED_BRANCHES = {"main", "master", "develop", "development", "dev", "desa", "inte", "int",
+                      "pre", "preprod", "prod", "production", "staging", "release", "qa", "test", "uat"}
+FETCH_JOB = "__origin"  # trabajo "Comprobar con origin": ningun perfil puede llamarse asi
+SIZE_TTL = 600  # segundos que vale el tamaño medido de una carpeta
+
+
+def job_who(name: str) -> str:
+    return "la comprobación con origin" if name == FETCH_JOB else name
+
+
+def note_branch(profile: str, repo: str, branch: str, new: bool) -> None:
+    """Apunta una rama que devws ha creado para el espacio. new: creada desde
+    una base (la de origin, si se sube, tambien es del espacio); si no, ya
+    existia en origin y solo la copia local es del espacio."""
+    with state_tx() as st:
+        lst = st.setdefault("branches", {}).setdefault(profile, [])
+        lst[:] = [e for e in lst if (e["repo"], e["branch"]) != (repo, branch)]
+        lst.append({"repo": repo, "branch": branch, "new": new})
+
+
+def note_used(profile: str) -> None:
+    with state_tx() as st:
+        st.setdefault("used", {})[profile] = time.time()
+
+
+def job_fetch(job: Job) -> list[str]:
+    """Comprobar con origin: git fetch --prune de todos los repos."""
+    errors = []
+    for r in repos():
+        job.step(f"{r['name']}: trayendo lo nuevo de origin")
+        try:
+            git(repo_path(r["name"]), "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
+        except (RuntimeError, HTTPException) as e:
+            errors.append(f"{r['name']}: {e.detail if isinstance(e, HTTPException) else e}")
+    return errors
+
+
+def fetched_at(p: Path) -> float | None:
+    """Cuando se trajo por ultima vez lo de origin (FETCH_HEAD)."""
+    try:
+        return (p / git(p, "rev-parse", "--git-path", "FETCH_HEAD").strip()).stat().st_mtime
+    except (RuntimeError, OSError):
+        return None
+
+
+def rev_count(p: Path, rng: str) -> int:
+    return int(git(p, "rev-list", "--count", rng).strip())
+
+
+def dest_ref(p: Path, dest: str | None) -> str | None:
+    """Ref del destino de una rama: origin/<dest> o, si no esta, la local."""
+    for ref in (f"refs/remotes/origin/{dest}", f"refs/heads/{dest}") if dest else ():
+        if _ref_exists(p, ref):
+            return ref
+    return None
+
+
+def integrated(p: Path, ref: str, dest: str) -> tuple[int, bool | None]:
+    """(commits de ref que no estan en dest, si lo que aporta ya esta en dest).
+    Con commits propios: si mergear ref en dest no cambiaria nada (merge-tree),
+    ya esta dentro, se integrara con merge, squash o rebase. Sin commits
+    propios: mergeada si dest tiene un merge suyo; si no, es una rama sin
+    trabajo. None: no se sabe (git anterior a 2.38)."""
+    own = rev_count(p, f"{dest}..{ref}")
+    if own == 0:
+        tip = git(p, "rev-parse", ref).strip()
+        merges = git(p, "rev-list", "--merges", "--parents", f"{tip}..{dest}").splitlines()
+        return 0, any(tip in line.split()[2:] for line in merges)
+    res = subprocess.run(["git", "-C", str(p), "merge-tree", "--write-tree", dest, ref],
+                         capture_output=True, text=True)
+    if res.returncode not in (0, 1):  # 1 = con conflictos: no esta dentro
+        return own, None
+    return own, res.stdout.split("\n", 1)[0].strip() == git(p, "rev-parse", f"{dest}^{{tree}}").strip()
+
+
+def stash_counts(p: Path) -> dict[str, int]:
+    """Entradas de stash por rama (el stash es comun al repo y sus worktrees)."""
+    out: dict[str, int] = {}
+    for line in git(p, "stash", "list", "--format=%gs").splitlines():
+        if m := re.match(r"(?:WIP on|On) (.+?): ", line):
+            out[m[1]] = out.get(m[1], 0) + 1
+    return out
+
+
+def branch_health(p: Path, branch: str, dest: str | None, stash: dict[str, int]) -> dict:
+    """Estado de una rama local frente a origin y a su destino. unpushed: commits
+    que no estan en origin/<rama> (si nunca se subio, los propios); own: commits
+    que no estan en el destino; merged: lo que aporta ya esta en el destino."""
+    local, remote = f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"
+    dref = dest_ref(p, dest)
+    h = {"branch": branch, "dest": dest if dref else None, "pushed": _ref_exists(p, remote),
+         "gone": git(p, "for-each-ref", "--format=%(upstream:track)", local).strip() == "[gone]",
+         "stash": stash.get(branch, 0), "own": None, "merged": None, "unpushed": None}
+    if dref:
+        h["own"], h["merged"] = integrated(p, local, dref)
+    h["unpushed"] = rev_count(p, f"{remote}..{local}") if h["pushed"] else h["own"]
+    h["tags"] = health_tags(h)
+    return h
+
+
+def health_tags(h: dict) -> list[list[str]]:
+    """Lo que la UI enseña de la rama: [nivel, texto], nivel ok | info | warn."""
+    own, dest, n = h["own"], h["dest"], h["unpushed"]
+    plural = lambda k, s: f"{k} {s}{'s' if k != 1 else ''}"
+    tags = []
+    if h["merged"]:
+        tags.append(["ok", f"mergeada en {dest}"])
+    elif own == 0:
+        tags.append(["info", "al día con origin" if h["branch"] == dest else "sin commits propios"])
+    elif h["gone"]:  # tenia upstream y en origin ya no esta. Sin numero: tras un
+        tags.append(["warn", "borrada en origin · sin mergear"])  # squash, own cuenta de mas
+    elif not h["pushed"]:
+        tags.append(["warn", "nunca subida" + (f" · {plural(own, 'commit')}" if own else "")])
+    elif n:
+        tags.append(["warn", f"{plural(n, 'commit')} sin subir"])
+    elif dest:
+        tags.append(["info", f"sin mergear en {dest}"])
+    else:
+        tags.append(["info", "al día con origin"])
+    if h["stash"]:
+        tags.append(["warn", plural(h["stash"], "stash")])
+    return tags
+
+
+def wt_last_activity(d: Path, changed: list[str]) -> float:
+    """Ultima vez que se toco el worktree: movimiento de git en el (commit,
+    checkout, reset…: su reflog) o edicion de un fichero con cambios."""
+    times = [0.0]
+    try:
+        gitdir = d / (d / ".git").read_text().split("gitdir:", 1)[1].strip()
+        times.append((gitdir / "logs" / "HEAD").stat().st_mtime)
+    except (OSError, IndexError):
+        pass
+    for rel in changed[:500]:
+        try:
+            times.append((d / rel.rstrip("/")).stat().st_mtime)
+        except OSError:
+            pass
+    return max(times)
+
+
+_sizes: dict[str, tuple[float, int | None]] = {}
+_sizes_thread: threading.Thread | None = None
+
+
+def _measure(dirs: list[Path]) -> None:
+    du = shutil.which("du")
+    for d in dirs:
+        try:
+            if du:  # -s sin seguir enlaces (el .github del worktree apunta al original)
+                out = subprocess.run([du, "-sk", str(d)], capture_output=True, text=True, timeout=300).stdout
+                size = int(out.split()[0]) * 1024
+            else:
+                size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file() and not f.is_symlink())
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            size = None
+        _sizes[str(d)] = (time.time(), size)
+
+
+def dir_sizes(dirs: list[Path]) -> tuple[dict[str, int | None], bool]:
+    """(tamaño en disco de cada carpeta, si aun se esta midiendo). du en un
+    node_modules tarda: lo que no esta medido se mide en segundo plano."""
+    global _sizes_thread
+    now, out, todo = time.time(), {}, []
+    for d in dirs:
+        hit = _sizes.get(str(d))
+        out[str(d)] = hit[1] if hit else None
+        if not hit or now - hit[0] > SIZE_TTL:
+            todo.append(d)
+    busy = bool(_sizes_thread and _sizes_thread.is_alive())
+    if todo and not busy:
+        _sizes_thread = threading.Thread(target=_measure, args=(todo,), daemon=True)
+        _sizes_thread.start()
+        busy = True
+    return out, busy and any(out[str(d)] is None for d in dirs)
+
+
+def repo_report(profile: str, r: str, d: Path, branch: str | None, readonly: bool,
+                dest: str | None, stashes: dict) -> tuple[dict, float]:
+    """Estado de un repo de un espacio (o de un worktree suelto) y cuando se toco."""
+    e = {"repo": r, "dir": d.name if d.is_dir() else None, "readonly": readonly,
+         "branch": branch, "dirty": 0, "health": None}
+    last = 0.0
+    try:
+        p = repo_path(r)
+        if d.is_dir():
+            changed = wt_changes(d)
+            e["dirty"], last = len(changed), wt_last_activity(d, changed)
+            e["branch"] = git(d, "branch", "--show-current").strip() or None
+        if e["branch"] and not readonly and _ref_exists(p, f"refs/heads/{e['branch']}"):
+            if r not in stashes:
+                stashes[r] = stash_counts(p)
+            e["health"] = branch_health(p, e["branch"], dest or default_branch(p), stashes[r])
+    except (RuntimeError, HTTPException) as ex:
+        e["error"] = str(ex.detail if isinstance(ex, HTTPException) else ex)
+    return e, last
+
+
+def verdict(running: bool, working: bool, idle: int | None, rows: list[dict],
+            in_place: bool = False) -> tuple[str, list[str]]:
+    """(borrable | revisar | en_uso, motivos). Borrable: no se pierde nada al
+    borrarlo y, o esta todo mergeado, o lleva STALE_DAYS sin tocarse."""
+    if working:
+        return "en_uso", ["está trabajando"]
+    if running:
+        return "en_uso", ["está arrancado"]
+    stale = idle is not None and idle >= STALE_DAYS
+    old = [f"sin uso desde hace {idle} días"] if stale else []
+    if in_place:
+        return ("borrable", old + ["solo se borra el espacio: las ramas de tus carpetas no se tocan"]) if stale else ("en_uso", [])
+    risks, merged = [], []
+    for e in rows:
+        r, h = e["repo"], e["health"]
+        if e.get("error"):
+            risks.append(f"{r}: {e['error']}")
+        if e["dirty"]:
+            risks.append(f"{r}: {e['dirty']} fichero{'s' if e['dirty'] != 1 else ''} sin commitear")
+        if e["readonly"]:
+            continue
+        if e["dir"] and not e["branch"]:
+            risks.append(f"{r}: worktree sin rama (detached)")
+        if not h:
+            continue
+        if h["stash"]:
+            risks.append(f"{r}: {h['stash']} stash")
+        if h["merged"]:
+            merged.append(f"{r}: mergeada en {h['dest']}")
+        elif h["own"] != 0:
+            risks.append(f"{r}: " + ", ".join(t for lvl, t in h["tags"] if lvl != "ok" and "stash" not in t)
+                         if h["own"] is not None else f"{r}: no se sabe si está mergeada")
+    if risks:
+        return ("revisar", old + risks) if stale else ("en_uso", risks)
+    if merged:
+        return "borrable", merged + old
+    return ("borrable", old + ["nada sin subir ni sin mergear"]) if stale else ("en_uso", [])
+
+
+def cleanup_report() -> dict:
+    state = load_state()
+    jobs, now = state.get("jobs", {}), time.time()
+    stashes: dict = {}
+    spaces, orphans, sized = {}, [], []
+    for name in api_profiles_list():
+        prof = load_profile(name) or {}
+        is_wt = bool(prof.get("worktree"))
+        rows, times = [], [state.get("used", {}).get(name, 0.0)]
+        try:
+            times.append(time.mktime(time.strptime(prof.get("created_at", ""), "%Y-%m-%d %H:%M")))
+        except ValueError:
+            pass
+        if is_wt:
+            ro, bases = set(prof.get("readonly", [])), prof.get("bases", {})
+            for r, b in prof.get("repos", {}).items():
+                d = wt_dir_for(name, r)
+                e, t = repo_report(name, r, d, b, r in ro, bases.get(r), stashes)
+                rows.append(e)
+                times.append(t)
+                if d.is_dir():
+                    sized.append(d)
+        last = max(times) or None
+        idle = int((now - last) // 86400) if last else None
+        working = jobs.get(name, {}).get("status") == "running"
+        running = bool(space_ids(name, prof, state))
+        v, why = verdict(running, working, idle, rows, in_place=not is_wt)
+        spaces[name] = {"name": name, "worktree": is_wt, "running": running, "working": working,
+                        "last_used": last, "idle_days": idle, "verdict": v, "reasons": why, "repos": rows,
+                        "dirs": [str(wt_dir_for(name, e["repo"])) for e in rows if e["dir"]]}
+    for o in orphan_worktrees():
+        d = WT_DIR / o["dir"]
+        prof = load_profile(o["profile"]) or {}
+        e, t = repo_report(o["profile"], o["repo"], d, o["branch"], o["branch"] is None,
+                           prof.get("bases", {}).get(o["repo"]), stashes)
+        idle = int((now - t) // 86400) if t else None
+        v, why = verdict(False, False, idle, [e])
+        orphans.append({**o, "last_used": t or None, "idle_days": idle, "verdict": v, "reasons": why,
+                        "repos": [e], "dirs": [str(d)]})
+        sized.append(d)
+    sizes, measuring = dir_sizes(sized)
+    for x in [*spaces.values(), *orphans]:
+        vals = [sizes.get(d) for d in x.pop("dirs")]
+        x["size"] = sum(vals) if vals and None not in vals else (0 if not vals else None)
+    fetched = {r["name"]: fetched_at(repo_path(r["name"])) for r in repos()}
+    oldest = min(fetched.items(), key=lambda kv: kv[1] or 0, default=(None, None))
+    return {"stale_days": STALE_DAYS, "spaces": spaces, "orphans": orphans, "measuring": measuring,
+            "fetched": {"repo": oldest[0], "at": oldest[1]}, "fetch_job": jobs.get(FETCH_JOB)}
+
+
+@app.get("/api/cleanup")
+def api_cleanup():
+    return cleanup_report()
+
+
+@app.post("/api/cleanup/fetch")
+def api_cleanup_fetch():
+    start_job(FETCH_JOB, "fetch")
+    return {"ok": True}
+
+
+class CleanupTargets(BaseModel):
+    spaces: list[str] = []
+    orphans: list[str] = []  # carpetas de worktrees/ (perfil__repo)
+
+
+class BranchDel(BaseModel):
+    repo: str
+    branch: str
+    local: bool = False
+    remote: bool = False
+
+
+class CleanupRemove(CleanupTargets):
+    branches: list[BranchDel] = []  # las del plan que el usuario ha visto y confirmado
+    force: bool = False  # perder los cambios sin commitear de los worktrees
+
+
+def cleanup_targets(t: CleanupTargets) -> list[dict]:
+    """Lo que se quiere borrar: [{kind, name, profile, items: [(repo, carpeta)]}].
+    Un espacio incluye sus repos, los que tienen ramas suyas apuntadas y las
+    carpetas suyas que ya no estan en el perfil (repos que se quitaron)."""
+    known = {r["name"] for r in repos()}
+    recs = load_state().get("branches", {})
+    out = []
+    for name in t.spaces:
+        prof = load_profile(check_name(name, "perfil"))
+        if prof is None:
+            raise HTTPException(404, f"perfil no existe: {name}")
+        names = list(prof.get("repos", {})) if prof.get("worktree") else []
+        names += [e["repo"] for e in recs.get(name, [])]
+        names += [d.name.partition("__")[2] for d in WT_DIR.glob(f"{name}__*") if d.is_dir()] if WT_DIR.exists() else []
+        out.append({"kind": "space", "name": name, "profile": name, "prof": prof,
+                    "items": [(r, wt_dir_for(name, r)) for r in dict.fromkeys(names) if r in known]})
+    for dir in t.orphans:
+        d = WT_DIR / dir
+        if "__" not in dir or "/" in dir or "\\" in dir or not d.is_dir():
+            raise HTTPException(404, f"worktree no existe: {dir}")
+        prof, _, r = dir.partition("__")
+        if r not in known:
+            raise HTTPException(404, f"repo desconocido: {r}")
+        out.append({"kind": "orphan", "name": dir, "profile": prof, "prof": load_profile(prof) or {},
+                    "items": [(r, d)]})
+    return out
+
+
+def branch_kept_by(p: Path, repo: str, branch: str, profile: str, removing: set[Path]) -> str | None:
+    """Por que no se puede borrar la rama aunque sea del espacio: protegida,
+    la usa otro espacio (o es su base) o esta abierta en otro sitio."""
+    if branch in PROTECTED_BRANCHES or branch == default_branch(p):
+        return "rama protegida"
+    for f in sorted(PROFILES_DIR.glob("*.toml")) if PROFILES_DIR.exists() else []:
+        try:
+            other = tomllib.loads(f.read_text())
+        except tomllib.TOMLDecodeError:
+            continue
+        if f.stem != profile and other.get("repos", {}).get(repo) == branch:
+            return f"la usa el espacio {f.stem}"
+        if other.get("bases", {}).get(repo) == branch:
+            return f"es la base del espacio {f.stem}"
+    at = branch_open_at(p, branch)
+    if at and Path(at).resolve() not in removing:
+        return f"está abierta en {place(at)}"
+    return None
+
+
+def branch_plan(profile: str, repo: str, branch: str, new: bool, dest: str | None,
+                removing: set[Path], offline: set[str]) -> dict:
+    """Que se hace con una rama del espacio al borrarlo: local se borra si no se
+    pierde nada (mergeada, sin commits propios o todo subido); la de origin solo
+    si la creo el espacio y ya esta mergeada (o no tiene commits propios)."""
+    p = repo_path(repo)
+    local, remote = f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"
+    has_local, has_remote = _ref_exists(p, local), _ref_exists(p, remote)
+    e = {"repo": repo, "branch": branch, "local": False, "remote": False,
+         "has_local": has_local, "has_remote": has_remote, "keep_local": None, "keep_remote": None}
+    why = branch_kept_by(p, repo, branch, profile, removing)
+    if why:
+        e["keep_local"] = why if has_local else None
+        e["keep_remote"] = why if has_remote and new else None
+        return e
+    dref = dest_ref(p, dest or default_branch(p))
+    dname = (dest or default_branch(p)) if dref else None
+    if has_local:
+        own, merged = integrated(p, local, dref) if dref else (None, None)
+        unpushed = rev_count(p, f"{remote}..{local}") if has_remote else own
+        gone = git(p, "for-each-ref", "--format=%(upstream:track)", local).strip() == "[gone]"
+        if merged or own == 0 or unpushed == 0:
+            e["local"] = True
+        elif gone and not has_remote:
+            e["keep_local"] = "borrada en origin y sin mergear"
+        elif unpushed:
+            e["keep_local"] = (f"{unpushed} commits que solo están en local" if unpushed != 1
+                               else "1 commit que solo está en local")
+        else:
+            e["keep_local"] = "no se sabe si está mergeada"
+    if has_remote:
+        if not new:
+            e["keep_remote"] = None  # ya estaba en origin: no es del espacio, ni se menciona
+        elif repo in offline:
+            e["keep_remote"] = "sin conexión con origin"
+        else:
+            own, merged = integrated(p, remote, dref) if dref else (None, None)
+            if merged or own == 0:
+                e["remote"] = True
+            else:
+                e["keep_remote"] = f"sin mergear en {dname}" if dname else "no se sabe si está mergeada"
+    return e
+
+
+def target_plan(x: dict, offline: set[str]) -> dict:
+    """Plan de borrado de un espacio o worktree suelto: carpetas y ramas."""
+    removing = {d.resolve() for _, d in x["items"] if d.is_dir()}
+    recs = {(e["repo"], e["branch"]): e["new"]
+            for e in load_state().get("branches", {}).get(x["profile"], [])}
+    bases = x["prof"].get("bases", {})
+    dirs, branches = [], []
+    for r, d in x["items"]:
+        cands = {b: new for (rr, b), new in recs.items() if rr == r}
+        if d.is_dir():
+            dirs.append({"repo": r, "dir": d.name, "dirty": wt_dirty(d)})
+            try:
+                cur = git(d, "branch", "--show-current").strip()
+            except RuntimeError:
+                cur = ""
+            if cur:
+                cands.setdefault(cur, False)  # de antes de apuntarlas: solo la local
+        for b, new in cands.items():
+            e = branch_plan(x["profile"], r, b, new, bases.get(r), removing, offline)
+            if e["has_local"] or (new and e["has_remote"]):
+                branches.append(e)
+    running = x["kind"] == "space" and bool(space_ids(x["name"], x["prof"], load_state()))
+    return {"kind": x["kind"], "name": x["name"], "running": running, "dirs": dirs, "branches": branches}
+
+
+@app.post("/api/cleanup/plan")
+def api_cleanup_plan(t: CleanupTargets):
+    """Que se borraria (y que se conserva y por que), con origin recien traido."""
+    targets = cleanup_targets(t)
+    busy = _busy_job()
+    if busy:
+        raise HTTPException(409, f"espera: {job_who(busy[0])} todavia esta trabajando")
+    offline = set()
+    for r in sorted({r for x in targets for r, _ in x["items"]}):
+        try:
+            git(repo_path(r), "fetch", "--prune", "--quiet", timeout=60)
+        except RuntimeError:
+            offline.add(r)
+    return {"targets": [target_plan(x, offline) for x in targets], "offline": sorted(offline)}
+
+
+def remove_logs(profile: str) -> None:
+    keep = {s["name"] for s in services()} | {"actividad"}
+    for f in LOGS_DIR.glob(f"{profile}--*.log") if LOGS_DIR.exists() else []:
+        if f.stem[len(profile) + 2:] in keep:
+            f.unlink(missing_ok=True)
+
+
+@app.post("/api/cleanup/remove")
+def api_cleanup_remove(req: CleanupRemove):
+    """Borra espacios y worktrees sueltos: sus carpetas, las ramas confirmadas
+    (solo si siguen siendo seguras de borrar) y, de un espacio, su perfil, sus
+    logs y su .code-workspace. Con cambios sin commitear: 409 salvo force."""
+    targets = cleanup_targets(req)
+    busy = _busy_job()
+    if busy:
+        raise HTTPException(409, f"espera: {job_who(busy[0])} todavia esta trabajando")
+    dirs = [(r, d) for x in targets for r, d in x["items"] if d.is_dir()]
+    dirty = [f"{d.name} ({n} fichero{'s' if n != 1 else ''})" for _, d in dirs if (n := wt_dirty(d))]
+    if dirty and not req.force:
+        raise HTTPException(409, "cambios sin commitear en " + ", ".join(dirty) + ": se perderian al borrar")
+    # el plan, antes de quitar las carpetas (dicen que rama tenia cada una)
+    plans = [target_plan(x, offline=set()) for x in targets]
+    for x in targets:
+        if x["kind"] == "space" and x["prof"].get("worktree"):
+            wt_down_profile(x["name"])
+    errors = wt_remove_dirs(dirs, force=True) if dirs else []
+    wanted = {(b.repo, b.branch): b for b in req.branches}
+    deleted, kept = [], []
+    for plan in plans:
+        for e in plan["branches"]:
+            w, p, b, r = wanted.get((e["repo"], e["branch"])), repo_path(e["repo"]), e["branch"], e["repo"]
+            if e["local"] and w and w.local:
+                try:
+                    git(p, "branch", "-D", b)
+                    deleted.append(f"{b} ({r})")
+                except RuntimeError as ex:
+                    errors.append(f"{r}: no se pudo borrar {b}: {ex}")
+            elif e["has_local"]:
+                kept.append(f"{b} ({r})" + (f": {e['keep_local']}" if e["keep_local"] else ""))
+            if e["remote"] and w and w.remote:
+                try:
+                    git(p, "push", "--quiet", "origin", "--delete", b, timeout=60)
+                    deleted.append(f"origin/{b} ({r})")
+                except RuntimeError as ex:
+                    errors.append(f"{r}: no se pudo borrar origin/{b}: {ex}")
+            elif e["remote"] or e["keep_remote"]:
+                kept.append(f"origin/{b} ({r})" + (f": {e['keep_remote']}" if e["keep_remote"] else ""))
+    gone = {(x["profile"], r) for x in targets for r, _ in x["items"]}
+    spaces = [x["name"] for x in targets if x["kind"] == "space"]
+    for name in spaces:
+        profile_file(name).unlink(missing_ok=True)
+        (WS_DIR / f"{name}.code-workspace").unlink(missing_ok=True)
+        remove_logs(name)
+    with state_tx() as st:
+        for name in spaces:
+            if st.get("active_profile") == name:
+                st["active_profile"] = None
+            for k in ("jobs", "used", "branches"):
+                st.get(k, {}).pop(name, None)
+        for prof, lst in st.get("branches", {}).items():
+            lst[:] = [e for e in lst if (prof, e["repo"]) not in gone]
+    return {"ok": not errors, "deleted": deleted, "kept": kept, "errors": errors}
+
+
 # --- MCP: devws como herramientas para un agente (Copilot, Claude...) ---------
 # Mismo proceso y mismas funciones que la UI, en http://127.0.0.1:{web_port}/mcp.
 # Las herramientas esperan a que acabe el trabajo en segundo plano y devuelven
@@ -2073,6 +2620,12 @@ Reglas:
   rama y otros espacios pueden usarla a la vez. No edites ni hagas commits ahi.
 - Arrancar un espacio para otro que este corriendo (force) y borrar un espacio
   (devws_remove_workspace) solo con confirmacion explicita del usuario.
+- Limpieza: en devws_status cada espacio dice en cleanup si sobra (verdict
+  borrable: todo mergeado o sin uso y sin nada que perder; revisar: viejo pero
+  con trabajo sin subir o sin mergear; en_uso). Al acabar una tarea o antes de
+  crear otro espacio, si hay espacios borrables, proponle al usuario borrarlos
+  (con sus ramas) y espera su confirmacion. De los de revisar, dile que les
+  falta; no los borres.
 - Commits y push los hace el agente con git dentro de cada worktree, como siempre.
 - Estado de un servicio: up, starting, down, crashed (devws lo arranco y su
   proceso murio: mira su log), other_space (su puerto lo usa el servicio de otro
@@ -2148,8 +2701,11 @@ def space_info(name: str) -> dict:
 @mcp.tool()
 def devws_status() -> dict:
     """Estado del workspace: repos (ruta, rama actual, cambios sin commitear),
-    espacios (perfiles) con sus rutas, cual esta arrancado y trabajos en curso."""
+    espacios (perfiles) con sus rutas, cual esta arrancado, trabajos en curso y,
+    por espacio, si ya sobra (cleanup: verdict borrable | revisar | en_uso,
+    dias sin uso y por que)."""
     state = load_state()
+    clean = cleanup_report()["spaces"]
     return {
         "workspace_root": str(WORKSPACE_ROOT),
         "repos": [{"name": r["name"], "path": str(repo_path(r["name"])), "kind": r.get("kind"),
@@ -2160,7 +2716,8 @@ def devws_status() -> dict:
                      for s in services()],
         "libraries": CONFIG.get("libraries", []),
         "active_profile": state.get("active_profile"),
-        "spaces": [space_info(n) for n in api_profiles_list()],
+        "spaces": [{**space_info(n), "cleanup": {k: clean[n][k] for k in ("verdict", "idle_days", "reasons")}}
+                   for n in api_profiles_list() if n in clean],
         "jobs": {p: j for p, j in state.get("jobs", {}).items() if j.get("status") == "running"},
     }
 
@@ -2233,18 +2790,19 @@ def devws_stop(name: str) -> dict:
 
 
 @mcp.tool()
-def devws_remove_workspace(name: str, force: bool = False) -> dict:
-    """Borra los worktrees de un espacio y su perfil (las ramas y commits se
-    conservan). Con cambios sin commitear falla salvo force=true, que los pierde:
-    solo con confirmacion explicita del usuario."""
-    prof = tool_call(_profile_or_404, name)
-    if not prof.get("worktree"):
-        raise ToolError(f"{name} es un perfil in-place: no tiene worktrees que borrar")
-    errors = []
-    if name in wt_profiles():
-        errors = tool_call(api_wt_remove, name, force=force)["errors"]
-    api_profiles_delete(name)
-    return {"ok": not errors, "errors": errors}
+def devws_remove_workspace(name: str, force: bool = False, delete_branches: bool = True) -> dict:
+    """Elimina un espacio: para sus servicios y borra sus worktrees, su perfil y
+    sus logs. Con delete_branches (por defecto) borra tambien las ramas que devws
+    creo para el: la local si no se pierde nada (mergeada, sin commits propios o
+    todo subido) y la de origin si la creo el espacio y ya esta mergeada. Nunca
+    ramas protegidas (main, develop, desa, inte, prod...), ni de otros espacios,
+    ni las de origin que ya existian. Devuelve lo borrado (deleted) y lo que se
+    conserva y por que (kept). Con cambios sin commitear falla salvo force=true,
+    que los pierde: solo con confirmacion explicita del usuario."""
+    plan = tool_call(api_cleanup_plan, CleanupTargets(spaces=[name]))
+    branches = [BranchDel(repo=e["repo"], branch=e["branch"], local=e["local"], remote=e["remote"])
+                for t in plan["targets"] for e in t["branches"]] if delete_branches else []
+    return tool_call(api_cleanup_remove, CleanupRemove(spaces=[name], branches=branches, force=force))
 
 
 @mcp.tool()
