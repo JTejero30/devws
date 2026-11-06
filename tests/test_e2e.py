@@ -8,6 +8,7 @@ Ejecutar: uv run pytest -v
 
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -230,6 +231,15 @@ def test_state_y_repos(ws):
 
 def test_ui_carga(ws):
     assert "<title>devws" in fetch(ws["ports"]["web_ui"])
+
+
+def test_ui_js_sin_errores_de_sintaxis(tmp_path):
+    """El JS de la UI no tiene build: un error de sintaxis deja la pagina en blanco."""
+    html = (DEVWS / "static" / "index.html").read_text()
+    js = tmp_path / "ui.js"
+    js.write_text("\n".join(re.findall(r"<script>(.*?)</script>", html, re.S)))
+    res = subprocess.run([shutil.which("node") or "node", "--check", str(js)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
 
 
 def test_up_down_in_place(ws):
