@@ -69,13 +69,14 @@ node/npm y uv en el PATH. Todo cambio va con su test.
   actualiza al preparar/arrancar salvo que tenga cambios o commits propios.
 - Dependencias de un worktree: solo al arrancarlo o con "instalar", y solo si
   cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`).
-- `git fetch --prune` solo al hacer checkout o crear worktree.
+- `git fetch --prune` solo al hacer checkout, crear worktree, "Comprobar con
+  origin" o pedir el plan de borrado de un espacio.
 - Al abrir una rama que ya existe en local (crear su worktree, cambiar de rama o
   checkout en el original) se pone en lo ultimo de origin/<rama> si solo le
   faltan commits (fast-forward). Si tiene commits sin subir y origin tambien ha
   avanzado, se abre tal cual y se avisa. Una rama ya abierta no se toca: el
   pull lo hace el usuario.
-- Un trabajo (arrancar/preparar/instalar/parar) a la vez, salvo Parar: corta el
+- Un trabajo (arrancar/preparar/instalar/parar/comprobar con origin) a la vez, salvo Parar: corta el
   trabajo en curso (mata fetch o instalador, deja de esperar puertos) y despues para.
 - Estado de un servicio: up, starting, down, crashed (lo arranco devws y su
   proceso murio; se olvida al arrancar o parar su espacio), other_space (su
@@ -84,18 +85,34 @@ node/npm y uv en el PATH. Todo cambio va con su test.
   con force (force en api_up para los servicios de otro espacio).
 - `/api/repos` dice donde esta abierta cada rama (`open`) y la rama real y los
   cambios de cada worktree (`worktrees`): con eso la UI avisa antes de arrancar.
+- Limpieza (`/api/cleanup`): por espacio, ultimo uso (`used` en state, reflog y
+  ficheros con cambios de sus worktrees, `created_at`), tamaño (du en segundo
+  plano) y estado de cada rama: nunca subida, commits sin subir, stash, sin
+  mergear, mergeada en su destino (base del perfil o rama por defecto; con
+  `git merge-tree`, vale para merge, squash y rebase) o borrada en origin.
+  Veredicto: borrable (nada que perder y todo mergeado o `STALE_DAYS` = 7 sin
+  uso), revisar (viejo con trabajo pendiente) o en_uso. "Comprobar con origin"
+  es un trabajo (`__origin`) que hace fetch de todos los repos.
+- devws apunta en state (`branches`) las ramas que crea para cada espacio
+  (`new`: desde una base; si no, copia local de una que ya estaba en origin).
+  Eliminar un espacio (`/api/cleanup/plan` y luego `/api/cleanup/remove` con lo
+  confirmado) borra sus carpetas, logs, .code-workspace y esas ramas: la local
+  si no se pierde nada, la de origin solo si es `new` y esta mergeada. Nunca una
+  protegida (`PROTECTED_BRANCHES`, la por defecto), de otro espacio, abierta en
+  otro sitio o que el usuario no confirmo.
 
 ## Sin probar en macOS
 
 - Fallback de psutil cuando `net_connections` da AccessDenied (escaneo por proceso).
 - Matar por arbol de procesos en lugar de killpg.
+- Limpieza: `du -sk` y `git merge-tree --write-tree` (git >= 2.38; si no, no se
+  sabe si una rama con commits propios esta mergeada).
 
 ## Pendiente (propuesto, sin hacer)
 
 1. Al quitar un repo de un espacio, borrar su worktree (pedir confirmacion si
-   tiene cambios sin commitear), para que no queden worktrees huerfanos; y
-   renombrar el panel de "carpetas de worktree que no pertenecen a ningun
-   espacio" a algo mas claro.
+   tiene cambios sin commitear). Hoy queda como "worktree suelto" en Limpieza,
+   desde donde se borra con su rama.
 2. Seguridad: quitar credenciales (`user:token@` en URLs, patrones `glpat-…` y
    similares) de los errores de git y de los logs antes de que lleguen a la UI
    o al MCP. El sitio natural es git_msg() en server.py.

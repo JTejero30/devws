@@ -2353,7 +2353,8 @@ def cleanup_report() -> dict:
     sizes, measuring = dir_sizes(sized)
     for x in [*spaces.values(), *orphans]:
         vals = [sizes.get(d) for d in x.pop("dirs")]
-        x["size"] = sum(vals) if vals and None not in vals else (0 if not vals else None)
+        x["size"] = sum(vals) if vals and None not in vals else None
+        x["measuring"] = measuring and None in vals
     fetched = {r["name"]: fetched_at(repo_path(r["name"])) for r in repos()}
     oldest = min(fetched.items(), key=lambda kv: kv[1] or 0, default=(None, None))
     return {"stale_days": STALE_DAYS, "spaces": spaces, "orphans": orphans, "measuring": measuring,
