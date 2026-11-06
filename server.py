@@ -859,14 +859,41 @@ def resolve_base(p: Path, name: str, branch: str, base: str | None) -> str:
     raise HTTPException(400, f"{name}: {branch} no existe; indica desde que rama crearla")
 
 
-def branch_start(p: Path, name: str, branch: str, base: str | None) -> tuple[list[str], str]:
-    """(opciones, punto de partida) para checkout / worktree add de `branch`:
-    rama local, rama de origin con tracking, o rama nueva sin tracking."""
+def is_ancestor(repo_dir: Path, a: str, b: str) -> bool:
+    """El commit `a` ya esta en `b` (b es a o viene de a)."""
+    return subprocess.run(["git", "-C", str(repo_dir), "merge-base", "--is-ancestor", a, b],
+                          capture_output=True).returncode == 0
+
+
+def ff_to_origin(p: Path, name: str, branch: str) -> str | None:
+    """Antes de abrir una rama local que ya existe: si origin/<rama> va por
+    delante y la local no tiene commits propios, la pone al dia (fast-forward).
+    Si tiene commits propios sin subir y origin tambien ha avanzado, no se toca
+    y se devuelve el aviso. Una rama abierta en algun working tree no se mueve:
+    lo dejaria desfasado."""
+    remote = f"refs/remotes/origin/{branch}"
+    if not _ref_exists(p, remote) or branch_open_at(p, branch):
+        return None
+    local = git(p, "rev-parse", f"refs/heads/{branch}").strip()
+    target = git(p, "rev-parse", remote).strip()
+    if is_ancestor(p, target, local):  # al dia, o solo por delante (commits sin subir)
+        return None
+    if not is_ancestor(p, local, target):
+        return (f"{name}: {branch} tiene commits sin subir y origin/{branch} también ha avanzado; "
+                f"se abre la rama local sin lo nuevo de origin (haz pull para juntarlas)")
+    git(p, "update-ref", f"refs/heads/{branch}", target, local)
+    return None
+
+
+def branch_start(p: Path, name: str, branch: str, base: str | None) -> tuple[list[str], str, str | None]:
+    """(opciones, punto de partida, aviso) para checkout / worktree add de
+    `branch`: rama local (puesta al dia con origin si se puede), rama de origin
+    con tracking, o rama nueva sin tracking."""
     if _ref_exists(p, f"refs/heads/{branch}"):
-        return [], branch
+        return [], branch, ff_to_origin(p, name, branch)
     if _ref_exists(p, f"refs/remotes/origin/{branch}"):
-        return ["-b", branch], f"origin/{branch}"
-    return ["--no-track", "-b", branch], resolve_base(p, name, branch, base)
+        return ["-b", branch], f"origin/{branch}", None
+    return ["--no-track", "-b", branch], resolve_base(p, name, branch, base), None
 
 
 def branch_open_at(p: Path, branch: str, exclude: Path | None = None) -> str | None:
@@ -880,18 +907,20 @@ def branch_open_at(p: Path, branch: str, exclude: Path | None = None) -> str | N
     return None
 
 
-def do_checkout(name: str, branch: str, base: str | None = None) -> str:
+def do_checkout(name: str, branch: str, base: str | None = None) -> str | None:
+    """Checkout en la carpeta original. Devuelve un aviso si la rama local no se
+    pudo poner al dia con origin."""
     p = repo_path(name)
     current = git(p, "branch", "--show-current").strip()
     if current == branch:
-        return branch
+        return None
     git(p, "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
     if git(p, "status", "--porcelain").strip():
         raise HTTPException(409, f"{name} tiene cambios sin commitear en su carpeta original; "
                                  "haz commit o stash antes de cambiar de rama")
-    opts, start = branch_start(p, name, branch, base)
+    opts, start, warn = branch_start(p, name, branch, base)
     git(p, "checkout", "-q", *opts, start)
-    return branch
+    return warn
 
 
 def _split_svc_id(svc_id: str) -> tuple[str | None, str]:
@@ -976,9 +1005,7 @@ def wt_ensure_readonly(name: str, branch: str, profile: str) -> str | None:
             pass
         elif git(d, "status", "--porcelain").strip():
             return f"{name}: worktree con cambios locales; no se actualiza a {branch}"
-        elif not on_branch and subprocess.run(
-                ["git", "merge-base", "--is-ancestor", head, target], cwd=d,
-                capture_output=True).returncode != 0:
+        elif not on_branch and not is_ancestor(d, head, target):
             return f"{name}: el worktree tiene commits que no estan en {branch}; no se actualiza"
         else:
             git(d, "checkout", "-q", "--detach", target)
@@ -990,13 +1017,16 @@ def wt_ensure_readonly(name: str, branch: str, profile: str) -> str | None:
     return None
 
 
-def wt_ensure(name: str, branch: str, profile: str, base: str | None = None) -> Path:
+def wt_ensure(name: str, branch: str, profile: str, base: str | None = None) -> str | None:
     """Deja el worktree del repo para el perfil en `branch` (lo crea si no existe).
     Si la rama ya esta abierta en otro working tree falla: git no permite la
-    misma rama en dos sitios y forzarlo (--force) acaba en lios."""
+    misma rama en dos sitios y forzarlo (--force) acaba en lios. Al abrir una
+    rama local que ya existia se pone al dia con origin si se puede; si no,
+    devuelve el aviso. Una rama ya abierta en el worktree no se toca."""
     p = repo_path(name)
     d = wt_dir_for(profile, name)
     git(p, "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
+    warn = None
     if d.exists():
         cur = git(d, "branch", "--show-current").strip()
         if cur != branch:
@@ -1006,18 +1036,18 @@ def wt_ensure(name: str, branch: str, profile: str, base: str | None = None) -> 
             other = branch_open_at(p, branch, exclude=d)
             if other:
                 raise HTTPException(409, branch_busy(name, branch, other))
-            opts, start = branch_start(p, name, branch, base)
+            opts, start, warn = branch_start(p, name, branch, base)
             git(d, "checkout", "-q", *opts, start)
     else:
         git(p, "worktree", "prune")
         other = branch_open_at(p, branch)
         if other:
             raise HTTPException(409, branch_busy(name, branch, other))
-        opts, start = branch_start(p, name, branch, base)
+        opts, start, warn = branch_start(p, name, branch, base)
         git(p, "worktree", "add", "-q", *opts, str(d), start, timeout=300)
     wt_link_github(name, d)
     wt_copy_ignored(name, d)
-    return d
+    return warn
 
 
 @app.post("/api/checkout")
@@ -1025,8 +1055,8 @@ def api_checkout(req: CheckoutReq):
     results = []
     for item in req.items:
         try:
-            do_checkout(item.repo, item.branch, item.base)
-            results.append({"repo": item.repo, "ok": True, "branch": item.branch})
+            warn = do_checkout(item.repo, item.branch, item.base)
+            results.append({"repo": item.repo, "ok": True, "branch": item.branch, **({"warn": warn} if warn else {})})
         except (HTTPException, RuntimeError) as e:
             results.append({"repo": item.repo, "ok": False,
                             "error": str(e.detail) if isinstance(e, HTTPException) else str(e)})
@@ -1620,7 +1650,9 @@ def job_prepare(job: Job, prof: dict, deps: bool = False) -> None:
                 job.step(f"AVISO {warn}")
             continue
         job.step(f"{rname}: worktree en {branch}" if not d.is_dir() else f"{rname}: comprobando worktree")
-        wt_ensure(rname, branch, job.profile, bases.get(rname))
+        warn = wt_ensure(rname, branch, job.profile, bases.get(rname))
+        if warn:
+            job.step(f"AVISO {warn}")
     if deps:
         for rname in prof.get("repos", {}):
             d = wt_dir_for(job.profile, rname)
@@ -1635,7 +1667,9 @@ def job_checkout(job: Job, prof: dict) -> None:
     for rname, branch in prof.get("repos", {}).items():
         before = git(repo_path(rname), "branch", "--show-current").strip()
         job.step(f"{rname}: checkout {branch}")
-        do_checkout(rname, branch, bases.get(rname))
+        warn = do_checkout(rname, branch, bases.get(rname))
+        if warn:
+            job.step(f"AVISO {warn}")
         if rname in libs and before != branch:
             for target in [rname, *libs[rname]]:
                 job.step(f"{target}: uv sync (cambio la libreria {rname})")

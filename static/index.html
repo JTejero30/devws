@@ -919,7 +919,8 @@ sel.blur();
 try {
 const [it] = await post("/api/checkout", { items: [{ repo: name, branch }] });
 // los errores del servidor ya suelen empezar por el nombre del repo
-toast(it.ok ? `${it.repo}: ahora en ${it.branch}` : it.error.startsWith(it.repo) ? it.error : `${it.repo}: ${it.error}`, !it.ok);
+if (it.ok && it.warn) toast(`${it.repo}: ahora en ${it.branch}. ⚠ ${it.warn.startsWith(it.repo + ": ") ? it.warn.slice(it.repo.length + 2) : it.warn}`, true);
+else toast(it.ok ? `${it.repo}: ahora en ${it.branch}` : it.error.startsWith(it.repo) ? it.error : `${it.repo}: ${it.error}`, !it.ok);
 } catch (e) { toast(e.message, true); }
 refreshRepos(); kick();
 }

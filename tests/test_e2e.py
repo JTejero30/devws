@@ -427,6 +427,81 @@ def test_rama_abierta_en_otro_sitio_no_se_fuerza(ws):
     c.delete("/api/profiles/dup")
 
 
+def test_rama_local_desfasada_se_pone_al_dia_con_origin(ws):
+    """Al abrir una rama que ya existe en local (crear worktree o checkout en el
+    original) se pone en lo ultimo de origin si solo le faltan commits; con
+    commits propios sin subir no se toca nada."""
+    c, dws, root = ws["c"], ws["dws"], ws["root"]
+    web = root / "web"
+    clone = root / "_clone_web"
+    sh(root, "git", "clone", "-q", str(root / "_remotes" / "web.git"), str(clone))
+    sh(clone, "git", "config", "user.email", "test@devws")
+    sh(clone, "git", "config", "user.name", "test")
+    sh(clone, "git", "checkout", "-q", "-b", "ff-x")
+
+    def push(msg: str) -> str:
+        (clone / "FF").write_text(msg)
+        sh(clone, "git", "add", ".")
+        sh(clone, "git", "commit", "-q", "-m", msg)
+        sh(clone, "git", "push", "-q", "origin", "HEAD:ff-x")
+        return git_out(clone, "rev-parse", "HEAD")
+
+    def local_commit(msg: str) -> str:
+        """Commit en la rama local ff-x del original sin hacer checkout."""
+        sha = git_out(web, "commit-tree", "ff-x^{tree}", "-p", "ff-x", "-m", msg)
+        sh(web, "git", "update-ref", "refs/heads/ff-x", sha)
+        return sha
+
+    v1 = push("v1")
+    sh(web, "git", "fetch", "-q", "origin")
+    sh(web, "git", "branch", "-q", "ff-x", "origin/ff-x")
+    v2 = push("v2")  # el original aun no lo sabe: lo trae el fetch de devws
+
+    # worktree nuevo de una rama local por detras: sale con lo ultimo de origin
+    d = dws / "worktrees" / "ffwt__web"
+    c.post("/api/profiles", {"name": "ffwt", "repos": {"web": "ff-x"}, "worktree": True})
+    prepare(c, "ffwt")
+    assert git_out(d, "rev-parse", "HEAD") == v2 != v1 and (d / "FF").read_text() == "v2"
+    assert git_out(web, "rev-parse", "ff-x") == v2
+    c.delete("/api/worktrees/ffwt")
+
+    # commits propios sin subir y origin tambien avanza: se abre la local tal cual y avisa
+    mine = local_commit("mio")
+    push("v3")
+    prepare(c, "ffwt")
+    assert git_out(d, "rev-parse", "HEAD") == mine
+    assert any("AVISO" in l and "commits sin subir" in l for l in c.get("/api/logs/ffwt--actividad")["lines"])
+    c.delete("/api/worktrees/ffwt")
+
+    # solo por delante de origin (nada nuevo en origin): ni se toca ni avisa
+    v4 = push("v4")
+    sh(web, "git", "fetch", "-q", "origin")
+    sh(web, "git", "update-ref", "refs/heads/ff-x", v4)
+    mine = local_commit("mio 2")
+    prepare(c, "ffwt")
+    assert git_out(d, "rev-parse", "HEAD") == mine
+    assert not any("AVISO" in l for l in c.get("/api/logs/ffwt--actividad")["lines"])
+    c.delete("/api/worktrees/ffwt")
+    c.delete("/api/profiles/ffwt")
+
+    # checkout en la carpeta original: igual
+    sh(web, "git", "update-ref", "refs/heads/ff-x", v1)
+    v5 = push("v5")
+    try:
+        [r] = c.post("/api/checkout", {"items": [{"repo": "web", "branch": "ff-x"}]})
+        assert r == {"repo": "web", "ok": True, "branch": "ff-x"}, r
+        assert git_out(web, "rev-parse", "HEAD") == v5 and (web / "FF").read_text() == "v5"
+        c.post("/api/checkout", {"items": [{"repo": "web", "branch": "main"}]})
+        mine = local_commit("mio 3")
+        push("v6")
+        [r] = c.post("/api/checkout", {"items": [{"repo": "web", "branch": "ff-x"}]})
+        assert r["ok"] and "commits sin subir" in r["warn"], r
+        assert git_out(web, "rev-parse", "HEAD") == mine
+    finally:
+        sh(web, "git", "checkout", "-q", "main")
+        sh(web, "git", "branch", "-q", "-D", "ff-x")
+
+
 def test_editar_perfil_y_sincronizar(ws):
     c, dws = ws["c"], ws["dws"]
     body = {"name": "sync", "repos": {"api": "feat-a"}, "services": ["api"], "worktree": True}

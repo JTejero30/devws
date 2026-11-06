@@ -70,6 +70,11 @@ node/npm y uv en el PATH. Todo cambio va con su test.
 - Dependencias de un worktree: solo al arrancarlo o con "instalar", y solo si
   cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`).
 - `git fetch --prune` solo al hacer checkout o crear worktree.
+- Al abrir una rama que ya existe en local (crear su worktree, cambiar de rama o
+  checkout en el original) se pone en lo ultimo de origin/<rama> si solo le
+  faltan commits (fast-forward). Si tiene commits sin subir y origin tambien ha
+  avanzado, se abre tal cual y se avisa. Una rama ya abierta no se toca: el
+  pull lo hace el usuario.
 - Un trabajo (arrancar/preparar/instalar/parar) a la vez, salvo Parar: corta el
   trabajo en curso (mata fetch o instalador, deja de esperar puertos) y despues para.
 - Estado de un servicio: up, starting, down, crashed (lo arranco devws y su
