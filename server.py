@@ -2250,15 +2250,17 @@ def dir_sizes(dirs: list[Path]) -> tuple[dict[str, int | None], bool]:
     return out, busy and any(out[str(d)] is None for d in dirs)
 
 
-def repo_report(profile: str, r: str, d: Path, branch: str | None, readonly: bool,
+def repo_report(profile: str, r: str, d: Path | None, branch: str | None, readonly: bool,
                 dest: str | None, stashes: dict) -> tuple[dict, float]:
-    """Estado de un repo de un espacio (o de un worktree suelto) y cuando se toco."""
-    e = {"repo": r, "dir": d.name if d.is_dir() else None, "readonly": readonly,
+    """Estado de un repo de un espacio (o de un worktree suelto) y cuando se toco.
+    d: su worktree (None en un espacio in-place: solo cuenta su rama)."""
+    on_disk = bool(d and d.is_dir())
+    e = {"repo": r, "dir": d.name if on_disk else None, "readonly": readonly,
          "branch": branch, "dirty": 0, "health": None}
     last = 0.0
     try:
         p = repo_path(r)
-        if d.is_dir():
+        if on_disk:
             changed = wt_changes(d)
             e["dirty"], last = len(changed), wt_last_activity(d, changed)
             e["branch"] = git(d, "branch", "--show-current").strip() or None
@@ -2271,19 +2273,18 @@ def repo_report(profile: str, r: str, d: Path, branch: str | None, readonly: boo
     return e, last
 
 
-def verdict(running: bool, working: bool, idle: int | None, rows: list[dict],
-            in_place: bool = False) -> tuple[str, list[str]]:
-    """(borrable | revisar | en_uso, motivos). Borrable: no se pierde nada al
-    borrarlo y, o esta todo mergeado, o lleva STALE_DAYS sin tocarse."""
+def verdict(running: bool, working: bool, idle: int | None, rows: list[dict]) -> tuple[str, list[str]]:
+    """(borrable | revisar | en_uso, motivos). Borrable: su rama ya esta
+    mergeada en su destino (las de los demas repos, mergeadas o sin commits
+    propios) y no se pierde nada al borrarlo. Revisar: lleva STALE_DAYS sin
+    tocarse y no esta mergeado. Si no, en uso."""
     if working:
         return "en_uso", ["está trabajando"]
     if running:
         return "en_uso", ["está arrancado"]
     stale = idle is not None and idle >= STALE_DAYS
     old = [f"sin uso desde hace {idle} días"] if stale else []
-    if in_place:
-        return ("borrable", old + ["solo se borra el espacio: las ramas de tus carpetas no se tocan"]) if stale else ("en_uso", [])
-    risks, merged = [], []
+    risks, merged, rest = [], [], []
     for e in rows:
         r, h = e["repo"], e["health"]
         if e.get("error"):
@@ -2303,17 +2304,20 @@ def verdict(running: bool, working: bool, idle: int | None, rows: list[dict],
         elif h["own"] != 0:
             risks.append(f"{r}: " + ", ".join(t for lvl, t in h["tags"] if lvl != "ok" and "stash" not in t)
                          if h["own"] is not None else f"{r}: no se sabe si está mergeada")
-    if risks:
-        return ("revisar", old + risks) if stale else ("en_uso", risks)
-    if merged:
+        else:  # sin commits propios (o es su propio destino): no hay nada que mergear
+            rest.append(f"{r}: {h['tags'][0][1]}")
+    if merged and not risks:
         return "borrable", merged + old
-    return ("borrable", old + ["nada sin subir ni sin mergear"]) if stale else ("en_uso", [])
+    if stale:
+        return "revisar", old + risks + rest
+    return "en_uso", risks
 
 
 def cleanup_report() -> dict:
     state = load_state()
     jobs, now = state.get("jobs", {}), time.time()
     stashes: dict = {}
+    known = {r["name"] for r in repos()}
     spaces, orphans, sized = {}, [], []
     for name in api_profiles_list():
         prof = load_profile(name) or {}
@@ -2323,20 +2327,22 @@ def cleanup_report() -> dict:
             times.append(time.mktime(time.strptime(prof.get("created_at", ""), "%Y-%m-%d %H:%M")))
         except ValueError:
             pass
-        if is_wt:
-            ro, bases = set(prof.get("readonly", [])), prof.get("bases", {})
-            for r, b in prof.get("repos", {}).items():
-                d = wt_dir_for(name, r)
-                e, t = repo_report(name, r, d, b, r in ro, bases.get(r), stashes)
-                rows.append(e)
-                times.append(t)
-                if d.is_dir():
-                    sized.append(d)
+        # in-place: sin carpetas propias, solo el estado de sus ramas en el original
+        ro, bases = set(prof.get("readonly", [])), prof.get("bases", {})
+        for r, b in prof.get("repos", {}).items():
+            if r not in known:
+                continue
+            d = wt_dir_for(name, r) if is_wt else None
+            e, t = repo_report(name, r, d, b, r in ro, bases.get(r), stashes)
+            rows.append(e)
+            times.append(t)
+            if d and d.is_dir():
+                sized.append(d)
         last = max(times) or None
         idle = int((now - last) // 86400) if last else None
         working = jobs.get(name, {}).get("status") == "running"
         running = bool(space_ids(name, prof, state))
-        v, why = verdict(running, working, idle, rows, in_place=not is_wt)
+        v, why = verdict(running, working, idle, rows)
         spaces[name] = {"name": name, "worktree": is_wt, "running": running, "working": working,
                         "last_used": last, "idle_days": idle, "verdict": v, "reasons": why, "repos": rows,
                         "dirs": [str(wt_dir_for(name, e["repo"])) for e in rows if e["dir"]]}
@@ -2622,11 +2628,11 @@ Reglas:
 - Arrancar un espacio para otro que este corriendo (force) y borrar un espacio
   (devws_remove_workspace) solo con confirmacion explicita del usuario.
 - Limpieza: en devws_status cada espacio dice en cleanup si sobra (verdict
-  borrable: todo mergeado o sin uso y sin nada que perder; revisar: viejo pero
-  con trabajo sin subir o sin mergear; en_uso). Al acabar una tarea o antes de
-  crear otro espacio, si hay espacios borrables, proponle al usuario borrarlos
-  (con sus ramas) y espera su confirmacion. De los de revisar, dile que les
-  falta; no los borres.
+  borrable: su rama ya esta mergeada en su destino y no se pierde nada;
+  revisar: lleva dias sin uso y no esta mergeado; en_uso). Al acabar una tarea
+  o antes de crear otro espacio, si hay espacios borrables, proponle al usuario
+  borrarlos (con sus ramas) y espera su confirmacion. De los de revisar, dile
+  como estan; no los borres.
 - Commits y push los hace el agente con git dentro de cada worktree, como siempre.
 - Estado de un servicio: up, starting, down, crashed (devws lo arranco y su
   proceso murio: mira su log), other_space (su puerto lo usa el servicio de otro

@@ -560,7 +560,8 @@ if (inProf && cur !== want) {
 br = `${code(cur || "sin rama")} → ${code(want)}`;
 notes.push(`checkout a ${esc(want)} al ${again}arrancar` + (ri.dirty ? ": fallará, la carpeta tiene cambios sin commitear" : ""));
 } else if (branchEdit === `${p.name}|${r}`) br = origBranchSelect(r);
-else br = code(cur || "sin rama") + (ri.dirty ? ' <span class="hint">· cambios sin commitear</span>' : "")
+else br = code(cur || "sin rama") + (inProf && !wt ? (h => h && h.branch === want ? healthHtml(h) : "")(repoHealth(p.name, r)) : "")
++ (ri.dirty ? ' <span class="hint">· cambios sin commitear</span>' : "")
 + (wt && !working ? ` <button class="link sm" data-k="chg:${esc(r)}" onclick="editOrigBranch('${esc(p.name)}','${esc(r)}')" title="cambia la rama de la carpeta original de ${esc(r)} (checkout)">cambiar</button>` : "");
 }
 const svcs = psv.filter(n => svcDef(n).repo === r);
@@ -614,7 +615,7 @@ const clBadges = !quiet ? "" : (cl.verdict === "borrable" ? `<span class="badge 
 + (stale ? ` <span class="badge warn" title="último uso: ${esc(fmtDate(cl.last_used))}">sin uso · ${cl.idle_days} días</span>` : "");
 if (quiet && !lines.length && cl.verdict === "borrable") lines.push(["ok", `Ya sobra: ${esc(cl.reasons.join(" · "))}`]);
 if (quiet && !lines.length && cl.verdict === "revisar")
-lines.push(["warn", `Sin uso desde hace ${cl.idle_days} días, pero con trabajo pendiente: ${esc(cl.reasons.filter(x => !x.startsWith("sin uso")).join(" · "))}`]);
+lines.push(["warn", `Sin uso desde hace ${cl.idle_days} días y sin mergear: ${esc(cl.reasons.filter(x => !x.startsWith("sin uso")).join(" · ")) || "nada que mergear"}`]);
 
 // acciones; las que ahora no se pueden usar dicen por que
 const wait = "Espera a que termine lo que está haciendo";

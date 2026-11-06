@@ -592,6 +592,11 @@ def test_limpieza_estado_de_las_ramas_y_veredicto(ws):
     assert tags_of(c, "lmp", "worker") == ["mergeada en main"]
     s = rep["spaces"]["lmp"]
     assert s["verdict"] == "borrable" and s["reasons"][0] == "worker: mergeada en main", s
+    # un espacio in-place tambien sobra cuando su rama esta mergeada
+    c.post("/api/profiles", {"name": "lmp-orig", "repos": {"worker": "lmp-x"}})
+    s = cleanup_of(c, "lmp-orig")
+    assert s["verdict"] == "borrable" and s["reasons"] == ["worker: mergeada en main"], s
+    c.delete("/api/profiles/lmp-orig")
 
     # GitLab borra la rama al mergear y se sigue trabajando en ella sin subir
     sh(other, "git", "push", "-q", "origin", "--delete", "lmp-x")
@@ -601,14 +606,19 @@ def test_limpieza_estado_de_las_ramas_y_veredicto(ws):
     commit_in(d, "tres")
     assert tags_of(c, "lmp", "worker") == ["borrada en origin · sin mergear"]
 
-    # un espacio sin trabajo propio: en uso los primeros dias, luego se puede borrar
+    # sin nada mergeado no se puede borrar aunque no tenga trabajo: viejo, a revisar
     c.post("/api/profiles", {"name": "lmp2", "repos": {"web": "lmp2-x"}, "bases": {"web": "main"},
                              "worktree": True})
     prepare(c, "lmp2")
     assert cleanup_of(c, "lmp2")["verdict"] == "en_uso"
     age_space(dws, "lmp2", 8)
     s = cleanup_of(c, "lmp2")
-    assert s["verdict"] == "borrable" and s["reasons"][0] == "sin uso desde hace 8 días", s
+    assert s["verdict"] == "revisar" and s["reasons"] == ["sin uso desde hace 8 días", "web: sin commits propios"], s
+    c.post("/api/profiles", {"name": "lmp3", "repos": {"api": "main"}})
+    age_space(dws, "lmp3", 30)
+    s = cleanup_of(c, "lmp3")
+    assert s["verdict"] == "revisar" and s["reasons"] == ["sin uso desde hace 30 días", "api: al día con origin"], s
+    c.delete("/api/profiles/lmp3")
 
     for name in ("lmp", "lmp2"):
         c.delete(f"/api/worktrees/{name}?force=true")

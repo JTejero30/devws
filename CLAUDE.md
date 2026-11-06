@@ -90,8 +90,9 @@ node/npm y uv en el PATH. Todo cambio va con su test.
   plano) y estado de cada rama: nunca subida, commits sin subir, stash, sin
   mergear, mergeada en su destino (base del perfil o rama por defecto; con
   `git merge-tree`, vale para merge, squash y rebase) o borrada en origin.
-  Veredicto: borrable (nada que perder y todo mergeado o `STALE_DAYS` = 7 sin
-  uso), revisar (viejo con trabajo pendiente) o en_uso. "Comprobar con origin"
+  Veredicto: borrable (solo si su rama ya esta mergeada y no se pierde nada;
+  las de sus otros repos, mergeadas o sin commits propios), revisar (`STALE_DAYS`
+  = 7 sin uso y sin mergear) o en_uso. Tambien para espacios in-place. "Comprobar con origin"
   es un trabajo (`__origin`) que hace fetch de todos los repos.
 - devws apunta en state (`branches`) las ramas que crea para cada espacio
   (`new`: desde una base; si no, copia local de una que ya estaba en origin).
