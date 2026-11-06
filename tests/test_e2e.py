@@ -906,3 +906,93 @@ def test_servicio_que_muere_al_arrancar_no_hace_esperar(ws):
     assert time.time() - t0 < 20 and "termino (codigo 3)" in r["warn"], r
     c.delete("/api/repos/muere")
     assert tomllib.loads(cfg.read_text()) == tomllib.loads(before)
+
+
+def test_solo_lectura_misma_rama_en_varios_espacios(ws):
+    """Un repo en solo lectura queda detached en lo ultimo de su rama: varios
+    espacios pueden usar la misma rama (p. ej. desa) a la vez."""
+    c, dws, root = ws["c"], ws["dws"], ws["root"]
+    clone = root / "_clone_desa"
+    sh(root, "git", "clone", "-q", str(root / "_remotes" / "commons_worker.git"), str(clone))
+    sh(clone, "git", "config", "user.email", "test@devws")
+    sh(clone, "git", "config", "user.name", "test")
+
+    def push_desa(msg: str) -> str:
+        (clone / "DESA").write_text(msg)
+        sh(clone, "git", "add", ".")
+        sh(clone, "git", "commit", "-q", "-m", msg)
+        sh(clone, "git", "push", "-q", "origin", "HEAD:desa")
+        return git_out(clone, "rev-parse", "HEAD")
+
+    sh(clone, "git", "checkout", "-q", "-b", "desa")
+    v1 = push_desa("v1")
+    status, out = c.post("/api/profiles", {"name": "roip", "repos": {"worker": "desa"},
+                                           "readonly": ["worker"]}, ok=False)
+    assert status == 400 and "solo lectura" in out["detail"], "solo en espacios worktree"
+
+    ro1, ro2 = dws / "worktrees" / "ro1__worker", dws / "worktrees" / "ro2__worker"
+    for p in ("ro1", "ro2"):
+        c.post("/api/profiles", {"name": p, "repos": {"worker": "desa"}, "readonly": ["worker"],
+                                 "worktree": True})
+        w = prepare(c, p)
+        assert w["pending"] == [] and w["readonly"] == ["worker"], w
+    for d in (ro1, ro2):
+        assert git_out(d, "branch", "--show-current") == "", "detached: la rama no se abre"
+        assert git_out(d, "rev-parse", "HEAD") == v1 and (d / "DESA").read_text() == "v1"
+    assert "readonly" in c.get("/api/profiles/ro1")
+
+    # con la rama libre, otro espacio puede ademas abrirla para desarrollar en ella
+    c.post("/api/profiles", {"name": "rodev", "repos": {"worker": "desa"}, "worktree": True})
+    prepare(c, "rodev")
+    assert git_out(dws / "worktrees" / "rodev__worker", "branch", "--show-current") == "desa"
+    c.delete("/api/worktrees/rodev")
+    c.delete("/api/profiles/rodev")
+
+    # avanza origin/desa: preparar lo trae (tras el fetch se ve pendiente)
+    v2 = push_desa("v2")
+    w = prepare(c, "ro1")
+    assert git_out(ro1, "rev-parse", "HEAD") == v2 and w["pending"] == []
+    assert wt_info(c, "ro2")["pending"] == ["worker"], "ro2 aun en v1: se actualiza al arrancar"
+
+    # con cambios sin commitear no se mueve ni falla: se avisa en el log
+    (ro2 / "local.txt").write_text("x")
+    prepare(c, "ro2")
+    assert git_out(ro2, "rev-parse", "HEAD") == v1
+    assert any("AVISO" in l and "cambios locales" in l for l in c.get("/api/logs/ro2--actividad")["lines"])
+    (ro2 / "local.txt").unlink()
+    prepare(c, "ro2")
+    assert git_out(ro2, "rev-parse", "HEAD") == v2
+
+    # pasar a una rama normal y volver a solo lectura
+    c.put("/api/profiles", {"name": "ro1", "repos": {"worker": "ro-nueva"}, "bases": {"worker": "desa"},
+                            "worktree": True})
+    prepare(c, "ro1")
+    assert git_out(ro1, "branch", "--show-current") == "ro-nueva"
+    c.put("/api/profiles", {"name": "ro1", "repos": {"worker": "desa"}, "readonly": ["worker"],
+                            "worktree": True})
+    prepare(c, "ro1")
+    assert git_out(ro1, "branch", "--show-current") == "" and git_out(ro1, "rev-parse", "HEAD") == v2
+
+    # rama que no existe: en solo lectura no se crea
+    c.put("/api/profiles", {"name": "ro1", "repos": {"worker": "nope"}, "readonly": ["worker"],
+                            "worktree": True})
+    assert "no existe la rama nope" in prepare(c, "ro1", expect="error")["error"]
+    c.delete("/api/worktrees/ro1")
+    c.delete("/api/profiles/ro1")
+
+    # un worktree detached huerfano se adopta en solo lectura de su rama
+    c.delete("/api/profiles/ro2")
+    orphans = c.get("/api/worktrees/orphans")
+    assert [(o["dir"], o["branch"], o["follows"]) for o in orphans] == [("ro2__worker", None, "desa")]
+    c.post("/api/worktrees/orphans/ro2__worker/adopt")
+    w = wait_job(c, "ro2")
+    assert w["readonly"] == ["worker"] and w["repos"] == {"worker": "desa"}
+    c.delete("/api/worktrees/ro2")
+    c.delete("/api/profiles/ro2")
+
+    # MCP: readonly en devws_create_workspace
+    err, w = mcp_tool(c, "devws_create_workspace", name="romcp", repos={"worker": "desa"}, readonly=["worker"])
+    assert not err and w["status"] == "ok" and w["readonly"] == ["worker"], w
+    assert git_out(Path(w["dirs"]["worker"]), "rev-parse", "HEAD") == v2
+    err, r = mcp_tool(c, "devws_remove_workspace", name="romcp")
+    assert not err and r["ok"], r

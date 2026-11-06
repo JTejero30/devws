@@ -237,6 +237,9 @@ class ProfileIn(BaseModel):
     worktree: bool = False
     # rama de partida para las ramas que aun no existen (repo -> rama base)
     bases: dict[str, str] = {}
+    # repos en solo lectura: worktree detached en lo ultimo de origin/<rama>
+    # (varios espacios pueden seguir la misma rama a la vez); solo con worktree
+    readonly: list[str] = []
 
 
 def repo_status(name: str) -> dict:
@@ -878,6 +881,46 @@ def wt_dir_for(profile: str, repo: str) -> Path:
     return WT_DIR / f"{profile}__{repo}"
 
 
+def readonly_ref(p: Path, name: str, branch: str) -> str:
+    """Ref que sigue un worktree de solo lectura: origin/<rama> o, si no esta en
+    origin, la rama local. Solo lectura no crea ramas."""
+    for ref in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}"):
+        if _ref_exists(p, ref):
+            return ref
+    raise HTTPException(400, f"{name}: no existe la rama {branch} (en solo lectura no se crean ramas)")
+
+
+def wt_ensure_readonly(name: str, branch: str, profile: str) -> str | None:
+    """Deja el worktree del repo para el perfil en HEAD detached en lo ultimo de
+    `branch` (lo crea si no existe). Git impide tener la misma rama abierta en
+    dos sitios, pero no el mismo commit: asi varios espacios pueden usar, p. ej.,
+    desa a la vez. Si hay cambios sin commitear o commits que no estan en la
+    rama no lo mueve (no se pierde nada) y devuelve el aviso."""
+    p = repo_path(name)
+    d = wt_dir_for(profile, name)
+    git(p, "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
+    target = git(p, "rev-parse", readonly_ref(p, name, branch)).strip()
+    if d.exists():
+        on_branch = git(d, "branch", "--show-current").strip()
+        head = git(d, "rev-parse", "HEAD").strip()
+        if not on_branch and head == target:
+            pass
+        elif git(d, "status", "--porcelain").strip():
+            return f"{name}: worktree con cambios locales; no se actualiza a {branch}"
+        elif not on_branch and subprocess.run(
+                ["git", "merge-base", "--is-ancestor", head, target], cwd=d,
+                capture_output=True).returncode != 0:
+            return f"{name}: el worktree tiene commits que no estan en {branch}; no se actualiza"
+        else:
+            git(d, "checkout", "-q", "--detach", target)
+    else:
+        git(p, "worktree", "prune")
+        git(p, "worktree", "add", "-q", "--detach", str(d), target, timeout=300)
+    wt_link_github(name, d)
+    wt_copy_ignored(name, d)
+    return None
+
+
 def wt_ensure(name: str, branch: str, profile: str, base: str | None = None) -> Path:
     """Deja el worktree del repo para el perfil en `branch` (lo crea si no existe).
     Si la rama ya esta abierta en otro working tree falla: git no permite la
@@ -1249,10 +1292,13 @@ def profile_body(req: ProfileIn, created_at: str | None = None) -> str:
         f'name = {toml_str(req.name)}',
         f'created_at = {toml_str(created_at or time.strftime("%Y-%m-%d %H:%M"))}',
         f'worktree = {"true" if req.worktree else "false"}',
-        "", "[repos]",
     ]
+    readonly = [r for r in req.readonly if r in req.repos]
+    if readonly:
+        body.append("readonly = [" + ", ".join(toml_str(r) for r in readonly) + "]")
+    body += ["", "[repos]"]
     body += [f'{toml_str(r)} = {toml_str(b)}' for r, b in req.repos.items()]
-    bases = {r: b for r, b in req.bases.items() if r in req.repos and b}
+    bases = {r: b for r, b in req.bases.items() if r in req.repos and r not in readonly and b}
     if bases:
         body += ["", "[bases]"] + [f'{toml_str(r)} = {toml_str(b)}' for r, b in bases.items()]
     body += ["", "[services]", "services = [" + ", ".join(toml_str(s) for s in req.services) + "]"]
@@ -1262,12 +1308,18 @@ def profile_body(req: ProfileIn, created_at: str | None = None) -> str:
 def profile_in(name: str, prof: dict) -> ProfileIn:
     return ProfileIn(name=name, repos=prof.get("repos", {}), worktree=bool(prof.get("worktree")),
                      services=prof.get("services", {}).get("services", []),
-                     bases=prof.get("bases", {}))
+                     bases=prof.get("bases", {}), readonly=prof.get("readonly", []))
+
+
+def check_profile(req: ProfileIn) -> None:
+    check_name(req.name, "perfil")
+    if req.readonly and not req.worktree:
+        raise HTTPException(400, "solo lectura solo se puede usar en espacios worktree")
 
 
 @app.post("/api/profiles")
 def api_profiles_save(req: ProfileIn):
-    check_name(req.name, "perfil")
+    check_profile(req)
     PROFILES_DIR.mkdir(exist_ok=True)
     f = profile_file(req.name)
     if f.exists():
@@ -1278,7 +1330,7 @@ def api_profiles_save(req: ProfileIn):
 
 @app.put("/api/profiles")
 def api_profiles_update(req: ProfileIn):
-    check_name(req.name, "perfil")
+    check_profile(req)
     old = load_profile(req.name)
     if old is None:
         raise HTTPException(404, f"perfil no existe: {req.name}")
@@ -1321,17 +1373,28 @@ def wt_profiles() -> dict[str, dict]:
             continue
         on_disk = {r: b for r, b in prof.get("repos", {}).items() if wt_dir_for(f.stem, r).is_dir()}
         if on_disk:
-            out[f.stem] = {"repos": on_disk, "services": profile_services(prof)}
+            out[f.stem] = {"repos": on_disk, "services": profile_services(prof),
+                           "readonly": [r for r in prof.get("readonly", []) if r in on_disk]}
     return out
 
 
 def wt_pending(profile: str) -> list[str]:
-    """Repos del perfil cuyo worktree falta o esta en otra rama (se aplica al arrancar)."""
+    """Repos del perfil cuyo worktree falta, esta en otra rama o, en solo lectura,
+    no esta en lo ultimo de su rama (se aplica al arrancar)."""
     out = []
-    for r, b in (load_profile(profile) or {}).get("repos", {}).items():
+    prof = load_profile(profile) or {}
+    readonly = set(prof.get("readonly", []))
+    for r, b in prof.get("repos", {}).items():
         d = wt_dir_for(profile, r)
         try:
-            if not d.is_dir() or git(d, "branch", "--show-current", timeout=5).strip() != b:
+            if not d.is_dir():
+                out.append(r)
+            elif r in readonly:
+                target = git(repo_path(r), "rev-parse", readonly_ref(repo_path(r), r, b), timeout=5).strip()
+                if (git(d, "branch", "--show-current", timeout=5).strip()
+                        or git(d, "rev-parse", "HEAD", timeout=5).strip() != target):
+                    out.append(r)
+            elif git(d, "branch", "--show-current", timeout=5).strip() != b:
                 out.append(r)
         except Exception:
             out.append(r)
@@ -1447,8 +1510,15 @@ def job_prepare(job: Job, prof: dict, deps: bool = False) -> None:
     cambiaron los ficheros que las definen (lockfiles), no por cambiar de rama.
     Para explorar o editar no hacen falta: se instalan al arrancar."""
     bases = prof.get("bases", {})
+    readonly = set(prof.get("readonly", []))
     for rname, branch in prof.get("repos", {}).items():
         d = wt_dir_for(job.profile, rname)
+        if rname in readonly:
+            job.step(f"{rname}: worktree de solo lectura en {branch}")
+            warn = wt_ensure_readonly(rname, branch, job.profile)
+            if warn:
+                job.step(f"AVISO {warn}")
+            continue
         job.step(f"{rname}: worktree en {branch}" if not d.is_dir() else f"{rname}: comprobando worktree")
         wt_ensure(rname, branch, job.profile, bases.get(rname))
     if deps:
@@ -1644,6 +1714,14 @@ def api_profile_install(name: str):
     return {"ok": True}
 
 
+def detached_follows(d: Path) -> str | None:
+    """Rama de origin cuyo ultimo commit es el HEAD detached del worktree."""
+    for ref in git(d, "branch", "-r", "--points-at", "HEAD", "--format=%(refname:short)").split():
+        if ref.startswith("origin/") and ref != "origin/HEAD":
+            return ref.removeprefix("origin/")
+    return None
+
+
 def orphan_worktrees() -> list[dict]:
     registered = {wt_dir_for(prof, r).name for prof, w in wt_profiles().items() for r in w["repos"]}
     out = []
@@ -1656,10 +1734,11 @@ def orphan_worktrees() -> list[dict]:
         prof, _, rname = d.name.partition("__")
         try:
             branch = git(d, "branch", "--show-current").strip() or None
+            follows = None if branch else detached_follows(d)
         except Exception:
             continue
         out.append({"dir": d.name, "profile": prof, "repo": rname,
-                    "branch": branch, "dirty": wt_dirty(d) > 0})
+                    "branch": branch, "follows": follows, "dirty": wt_dirty(d) > 0})
     return out
 
 
@@ -1679,8 +1758,12 @@ def api_wt_adopt(dir: str):
     except HTTPException:
         raise HTTPException(404, f"repo desconocido: {rname}")
     branch = git(WT_DIR / dir, "branch", "--show-current").strip()
+    readonly = False
     if not branch:
-        raise HTTPException(409, f"{dir}: el worktree no esta en ninguna rama (detached)")
+        # detached: se adopta en solo lectura si esta en lo ultimo de una rama de origin
+        branch, readonly = detached_follows(WT_DIR / dir), True
+        if not branch:
+            raise HTTPException(409, f"{dir}: el worktree no esta en ninguna rama (detached)")
     old = load_profile(prof)
     if old is not None and not old.get("worktree"):
         raise HTTPException(409, f"ya existe un perfil in-place llamado {prof}")
@@ -1691,6 +1774,7 @@ def api_wt_adopt(dir: str):
         # se suma al perfil worktree existente (varios repos del mismo perfil)
         req = profile_in(prof, old)
         req.repos = {**req.repos, rname: branch}
+    req.readonly = [r for r in req.readonly if r != rname] + ([rname] if readonly else [])
     PROFILES_DIR.mkdir(exist_ok=True)
     profile_file(prof).write_text(profile_body(req, old.get("created_at") if old else None))
     start_job(prof, "prepare")
@@ -1835,6 +1919,9 @@ Reglas:
   reinstala lo que cambio (uv.lock, package-lock.json...).
 - Si a mitad de tarea hace falta otro repo, llama otra vez a
   devws_create_workspace con el mismo nombre y solo ese repo: se anade.
+- Un repo que el espacio necesita en una rama pero en el que no se va a
+  desarrollar (p. ej. un servicio en desa) va en `readonly`: asi no se abre la
+  rama y otros espacios pueden usarla a la vez. No edites ni hagas commits ahi.
 - Arrancar un espacio para otro que este corriendo (force) y borrar un espacio
   (devws_remove_workspace) solo con confirmacion explicita del usuario.
 - Commits y push los hace el agente con git dentro de cada worktree, como siempre.
@@ -1897,6 +1984,7 @@ def space_info(name: str) -> dict:
         "name": name,
         "worktree": is_wt,
         "repos": prof.get("repos", {}),
+        "readonly": prof.get("readonly", []),
         "dirs": {r: str(wt_dir_for(name, r) if is_wt else repo_path(r))
                  for r in prof.get("repos", {}) if r in known},
         "active": state.get("active_profile") == name,
@@ -1927,7 +2015,8 @@ def devws_status() -> dict:
 
 @mcp.tool()
 def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, str] | None = None,
-                           services: list[str] | None = None, start: bool = False) -> dict:
+                           services: list[str] | None = None, start: bool = False,
+                           readonly: list[str] | None = None) -> dict:
     """Crea (o amplia, si ya existe) un espacio worktree: deja cada worktree en
     su rama, sin instalar dependencias (se instalan al arrancar o con
     devws_install_deps). Devuelve en `dirs` la ruta de cada worktree: edita ahi.
@@ -1935,6 +2024,10 @@ def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, st
     name: nombre corto del espacio (letras, numeros, . _ -), p. ej. la feature.
     repos: repo -> rama. Si la rama no existe se crea desde bases[repo] o desde
       la rama por defecto de origin.
+    readonly: repos de `repos` que solo se usan, no se desarrollan (p. ej. un
+      servicio que debe correr en desa): su worktree queda en lo ultimo de la
+      rama sin abrirla (HEAD detached), asi otros espacios pueden usar la misma
+      rama a la vez. No hagas commits en ellos.
     services: NO lo pases salvo que el usuario pida arrancar solo algunos: sin
       el, el espacio arranca todos los servicios (los de repos que no estan en el
       espacio corren desde su carpeta original).
@@ -1946,12 +2039,14 @@ def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, st
     for r in repos:
         tool_call(repo_path, r)
     if old is None:
-        req = ProfileIn(name=name, repos=repos, worktree=True, services=services or [], bases=bases or {})
+        req = ProfileIn(name=name, repos=repos, worktree=True, services=services or [], bases=bases or {},
+                        readonly=readonly or [])
         tool_call(api_profiles_save, req)
     else:
         req = profile_in(name, old)
         req.repos = {**req.repos, **repos}
         req.bases = {**req.bases, **(bases or {})}
+        req.readonly = [r for r in req.readonly if r not in repos] + (readonly or [])
         if services is not None:
             req.services = services
         tool_call(api_profiles_update, req)

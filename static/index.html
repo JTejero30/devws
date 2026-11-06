@@ -342,6 +342,7 @@ const running = isRunning(p);
 const anyBusy = !!busyJob();
 const pr = p.repos || {};
 const bases = p.bases || {};
+const ro = p.readonly || [];
 const wts = wtState[p.name];
 
 const mode = wt
@@ -350,7 +351,8 @@ const mode = wt
 
 const repoLines = Object.keys(pr).length
 ? Object.entries(pr).map(([r, b]) => `<div class="p-line"><span class="k">${esc(r)}</span><code>${esc(b)}</code>`
-+ (bases[r] && !(repos.find(x => x.name === r) || {}).branches?.includes(b) ? ` <span class="hint">nueva desde ${esc(bases[r])}</span>` : "")
++ (ro.includes(r) ? ' <span class="badge" title="worktree en lo último de la rama sin abrirla: otros espacios pueden usarla a la vez">solo lectura</span>' : "")
++ (!ro.includes(r) && bases[r] && !(repos.find(x => x.name === r) || {}).branches?.includes(b) ? ` <span class="hint">nueva desde ${esc(bases[r])}</span>` : "")
 + `</div>`).join("")
 : `<div class="p-line hint">ningún repo incluido</div>`;
 // worktree: el resto de repos estan en su carpeta original; se ve su rama y se
@@ -506,7 +508,7 @@ el.style.display = "block";
 el.innerHTML = '<div class="hint" style="margin-bottom:4px">Carpetas de worktree que no pertenecen a ningún espacio:</div>'
 + orph.map(o => `<div class="row">
 <span class="name" style="font-family:monospace;font-weight:400">${esc(o.dir)}</span>
-<span class="hint">rama ${esc(o.branch || "?")}</span>
+<span class="hint">${o.branch ? `rama ${esc(o.branch)}` : o.follows ? `solo lectura de ${esc(o.follows)}` : "sin rama (detached)"}</span>
 ${o.dirty ? '<span class="badge dirty">cambios sin commitear</span>' : ""}
 <span style="flex:1"></span>
 <button onclick="adoptOrphan('${esc(o.dir)}')">Añadir al espacio ${esc(o.profile)}</button>
@@ -538,7 +540,7 @@ $("#formTitle").textContent = name ? `Editando ${name}` : "Nuevo espacio";
 $("#pfName").value = name || "";
 $("#pfName").disabled = !!name;
 document.querySelector(`input[name=pfMode][value=${p && p.worktree !== true ? "inplace" : "wt"}]`).checked = true;
-renderFormRepos(p ? p.repos || {} : {}, p ? p.bases || {} : {});
+renderFormRepos(p ? p.repos || {} : {}, p ? p.bases || {} : {}, p ? p.readonly || [] : []);
 const cur = p ? profSvcs(p) : allServiceNames();
 formSvcOrder = [...cur, ...allServiceNames().filter(n => !cur.includes(n))];
 formSvcSelected = new Set(cur);
@@ -548,7 +550,7 @@ if (!name) $("#pfName").focus();
 }
 
 // cada repo: no incluir | rama existente | rama nueva desde una base
-function renderFormRepos(current, bases) {
+function renderFormRepos(current, bases, readonly) {
 $("#pfRepos").innerHTML = "<div class='sect' style='margin-top:10px'>Ramas</div>"
 + "<div class='hint' style='margin-bottom:4px'>Elige solo los repos en los que vas a trabajar. "
 + "Los no incluidos se quedan como están (sus servicios corren desde la carpeta original).</div>"
@@ -564,6 +566,9 @@ return `<div class="row">
 ${branches.map(b => `<option value="${esc(b)}" ${b === cur ? "selected" : ""}>${esc(b)}</option>`).join("")}
 <option value="__new" ${isNew ? "selected" : ""}>+ rama nueva…</option>
 </select>
+<label class="pf-ro" style="display:${cur && !isNew ? "inline-flex" : "none"};width:auto;gap:4px;align-items:center"
+title="Para repos en los que no vas a desarrollar (p. ej. un servicio en desa): el worktree se queda en lo último de la rama sin abrirla, así otros espacios pueden usar la misma rama a la vez. No hagas commits ahí.">
+<input type="checkbox" data-pfro="${esc(r.name)}" ${readonly.includes(r.name) ? "checked" : ""}> solo lectura</label>
 <span class="pf-new" style="display:${isNew ? "flex" : "none"};gap:6px;align-items:center;width:100%;padding-left:210px">
 <input type="text" data-pfnew="${esc(r.name)}" placeholder="nombre de la rama nueva" value="${isNew ? esc(cur) : ""}">
 <span class="hint">a partir de</span>
@@ -574,6 +579,7 @@ ${branches.map(b => `<option value="${esc(b)}" ${b === cur ? "selected" : ""}>${
 }
 function pfRepoChange(sel) {
 sel.parentElement.querySelector(".pf-new").style.display = sel.value === "__new" ? "flex" : "none";
+sel.parentElement.querySelector(".pf-ro").style.display = sel.value && sel.value !== "__new" ? "inline-flex" : "none";
 }
 
 function renderFormServices() {
@@ -601,17 +607,20 @@ function closeProfileForm() { $("#profileForm").style.display = "none"; editingP
 
 function formPayload() {
 const name = $("#pfName").value.trim() || (editingProfile || "");
-const repos = {}, bases = {};
+const repos = {}, bases = {}, readonly = [];
 document.querySelectorAll("[data-pfrepo]").forEach(sel => {
 const r = sel.dataset.pfrepo;
 if (sel.value === "__new") {
 const b = document.querySelector(`[data-pfnew="${r}"]`).value.trim();
 if (b) { repos[r] = b; bases[r] = document.querySelector(`[data-pfbase="${r}"]`).value; }
-} else if (sel.value) repos[r] = sel.value;
+} else if (sel.value) {
+repos[r] = sel.value;
+if (document.querySelector(`[data-pfro="${r}"]`).checked) readonly.push(r);
+}
 });
 const svc = formSvcOrder.filter(n => formSvcSelected.has(n));
 const worktree = document.querySelector("input[name=pfMode]:checked").value === "wt";
-return { name, repos, bases, services: svc, worktree };
+return { name, repos, bases, services: svc, worktree, readonly: worktree ? readonly : [] };
 }
 
 async function saveProfile() {

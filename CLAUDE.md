@@ -63,6 +63,10 @@ node/npm y uv en el PATH. Todo cambio va con su test.
   Los repos que no estan en el espacio corren desde su carpeta original.
 - Solo un espacio activo a la vez: sus servicios usan los puertos de la config.
 - Una rama solo puede estar abierta en un sitio (limitacion de git worktree).
+  Para repos que un espacio solo usa (p. ej. un servicio en desa) existe
+  "solo lectura" (`readonly = [...]` en el perfil): worktree con HEAD detached
+  en lo ultimo de origin/<rama>, asi varios espacios comparten la rama. Se
+  actualiza al preparar/arrancar salvo que tenga cambios o commits propios.
 - Dependencias de un worktree: solo al arrancarlo o con "instalar", y solo si
   cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`).
 - `git fetch --prune` solo al hacer checkout o crear worktree.
@@ -87,5 +91,5 @@ node/npm y uv en el PATH. Todo cambio va con su test.
    similares) de los errores de git y de los logs antes de que lleguen a la UI
    o al MCP.
 4. Opcional: refrescar ramas al abrir el formulario de espacio (o boton
-   "Actualizar ramas"); opcion de rama derivada o detached cuando una rama ya
-   esta abierta; clonar node_modules con APFS clone.
+   "Actualizar ramas"); opcion de rama derivada cuando una rama ya esta
+   abierta; clonar node_modules con APFS clone.
