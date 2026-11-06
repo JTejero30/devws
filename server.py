@@ -1066,7 +1066,8 @@ def api_up(name: str, force: bool = False):
     svc, prof, port, p, wt_dir = _svc_ctx(name)
     if wt_dir is not None and deps_missing(svc["repo"], wt_dir):
         return {"ok": False, "error": "deps",
-                "msg": f"{svc['repo']}: el worktree no tiene dependencias; arranca el espacio para instalarlas"}
+                "msg": f"{svc['repo']}: el worktree no tiene instaladas sus dependencias; "
+                       "se instalan al arrancar el espacio"}
     state = load_state()
     entry = state["services"].get(name)
     if entry and pid_alive(entry["pid"]) and not force:
@@ -1596,7 +1597,12 @@ def deps_missing(rname: str, d: Path) -> bool:
     r = next((r for r in repos() if r["name"] == rname), {})
     if not install_cmd(r):
         return False
-    return not (d / ("node_modules" if r.get("kind") == "npm" else ".venv")).exists()
+    if (d / ("node_modules" if r.get("kind") == "npm" else ".venv")).exists():
+        return False
+    # el instalador ya corrio con estos ficheros y no creo la carpeta: el repo no
+    # tiene dependencias que instalar (npm install sin dependencias no crea node_modules)
+    f = deps_stamp_file(d)
+    return not (f.exists() and f.read_text().strip() == deps_hash(rname, d))
 
 
 def job_prepare(job: Job, prof: dict, deps: bool = False) -> None:

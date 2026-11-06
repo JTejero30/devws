@@ -570,6 +570,19 @@ def test_servicio_caido_y_puerto_en_uso_por_otro_espacio(ws):
         c.delete(f"/api/profiles/{p}")
 
 
+def test_worktree_npm_sin_dependencias_arranca(ws):
+    """npm install sin dependencias no crea node_modules: no por eso faltan."""
+    c, ports, dws = ws["c"], ws["ports"], ws["dws"]
+    c.post("/api/profiles", {"name": "npmsin", "repos": {"web": "feat-a"}, "services": ["web"], "worktree": True})
+    c.post("/api/profiles/npmsin/start")
+    wait_job(c, "npmsin")
+    assert fetch(ports["web"]) == str(dws / "worktrees" / "npmsin__web")
+    c.post("/api/profiles/npmsin/stop")
+    wait_job(c, "npmsin")
+    c.delete("/api/worktrees/npmsin?force=true")  # npm install deja un package-lock.json sin versionar
+    c.delete("/api/profiles/npmsin")
+
+
 def mcp_rpc(c: Client, method: str, params: dict | None = None) -> dict:
     """JSON-RPC contra /mcp como lo haria un cliente MCP (Copilot): sin Origin."""
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}).encode()
