@@ -19,6 +19,8 @@ border:1px solid var(--border); border-radius:20px; color:var(--dim); }
 #active.busy { border-color:var(--yellow); color:var(--fg); }
 #active.err { border-color:var(--red); color:var(--fg); }
 #active button { padding:1px 10px; }
+#activeBtns { display:flex; gap:6px; align-items:center; }
+#activeBtns:empty { display:none; }
 .dot { width:8px; height:8px; border-radius:50%; background:var(--dim); display:inline-block; }
 .on .dot { background:var(--green); } .busy .dot { background:var(--yellow); animation:blink 1s infinite; }
 .err .dot { background:var(--red); }
@@ -57,14 +59,36 @@ button:disabled { opacity:.4; cursor:default; }
 .p-card { border:1px solid var(--border); border-radius:8px; padding:12px 14px; background:#0d1117; }
 .p-card.running { border-color:var(--green); }
 .p-card.busy { border-color:var(--yellow); }
+.p-card.warnb { border-color:var(--yellow); }
+.p-table { display:grid; grid-template-columns:minmax(80px,max-content) max-content minmax(90px,1fr) minmax(0,1.7fr);
+column-gap:12px; font-size:12px; align-items:start; margin-top:4px; }
+.p-table .th { font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); padding:4px 0; }
+.p-table .td { padding:6px 0; border-top:1px solid #21262d; min-width:0; overflow-wrap:anywhere; }
+.p-table .td.repo { font-weight:600; }
+.p-table code { color:var(--accent); }
+.p-table .note { grid-column:2 / -1; color:var(--yellow); font-size:11.5px; padding:0 0 6px; margin-top:-2px; }
+.p-table .p-branch { max-width:100%; min-width:0; padding:1px 6px; font-size:12px; }
+.svc { display:flex; flex-wrap:wrap; align-items:center; gap:2px 8px; }
+.svc + .svc { margin-top:4px; }
+.svc .svc-n { white-space:nowrap; }
+.svc button.link { padding:0 2px; font-size:12px; }
+.svc-why { color:#ff7b72; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.badge.ro { color:#79c0ff; border-color:#79c0ff66; }
+.badge.muted { border-style:dashed; }
+.warn-t { color:var(--yellow); }
+.p-others { font-size:12px; margin-top:8px; }
+.p-others code { color:var(--dim); }
+button.link.sm { padding:0 4px; font-size:11.5px; }
+button.link.x { padding:0 6px; font-size:15px; line-height:1; }
+button.off, button.off:hover { color:#6e7681; cursor:not-allowed; border-color:var(--border); }
+button.link.off, button.link.off:hover { border-color:transparent; }
+button.primary.off, button.primary.off:hover { background:#1f6feb40; border-color:#1f6feb40; color:#a5b8d6; }
+#active.warn { border-color:var(--yellow); color:var(--fg); }
+.warn .dot { background:var(--yellow); }
 .p-card h3 { margin:0; font-size:15px; display:flex; align-items:center; gap:8px; }
 .mode { font-size:12px; color:var(--dim); margin:4px 0 10px; }
 .mode b { color:var(--fg); font-weight:500; }
 .sect { font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:8px 0 2px; }
-.p-line { display:flex; gap:8px; align-items:center; font-size:12px; padding:2px 0; }
-.p-line .k { width:190px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; }
-.p-line code { color:var(--accent); }
-.p-line select.p-branch { flex:0 1 240px; min-width:120px; padding:1px 6px; font-size:12px; }
 .status-line { font-size:12px; margin-top:10px; padding:6px 10px; border-radius:6px; background:#161b22; }
 .status-line.busy { color:var(--yellow); }
 .status-line.err { color:var(--red); }
@@ -128,7 +152,7 @@ white-space:pre-wrap; word-break:break-all; color:#c9d1d9; }
 <body>
 <header>
 <h1>devws</h1>
-<div id="active"><span class="dot"></span><span id="activeText">cargando…</span></div>
+<div id="active"><span class="dot"></span><span id="activeText">cargando…</span><span id="activeBtns"></span></div>
 <span style="flex:1"></span>
 <span class="hint">un solo espacio arrancado a la vez · siempre los mismos puertos</span>
 </header>
@@ -228,7 +252,8 @@ white-space:pre-wrap; word-break:break-all; color:#c9d1d9; }
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const enc = encodeURIComponent;
-const STATUS = { up: "arriba", starting: "arrancando", down: "parado", external: "ocupado fuera de devws" };
+const STATUS = { up: "arriba", starting: "arrancando", down: "parado", crashed: "caído",
+external: "puerto ocupado fuera de devws", other_space: "en uso por otro espacio" };
 
 function _lineClass(t) {
 if (/^(---|===)/.test(t)) return "ln-step";
@@ -284,18 +309,59 @@ const profSvcs = p => (p.services && p.services.services && p.services.services.
 const svcId = (p, n) => p.worktree === true ? `${p.name}/${n}` : n;
 const svcOf = (p, n) => services.find(s => s.id === svcId(p, n) && (p.worktree === true || activeProfile === p.name));
 const isRunning = p => profSvcs(p).some(n => { const s = svcOf(p, n); return s && ["up", "starting"].includes(s.status); });
+const svcDef = n => services.find(s => s.name === n) || {};
+const repoOf = r => repos.find(x => x.name === r) || {};
+// activo: el que devws tiene como arrancado o el que tiene algo corriendo
+const isActive = p => activeProfile === p.name || isRunning(p);
+// estado de un servicio visto desde un espacio: el suyo, o "en uso por X" si su
+// puerto lo tiene otro espacio (entonces no se ofrece ninguna accion: no es suyo)
+function svcView(p, n) {
+if (p.worktree === true) {
+const s = services.find(x => x.id === `${p.name}/${n}`);
+return s ? { st: s.status, s, owner: s.owner } : { st: "down" };
+}
+const s = services.find(x => x.id === n);
+if (!s) return { st: "down" };
+if (activeProfile === p.name) return { st: s.status, s, owner: s.owner };
+// espacio in-place que no es el activo: lo que corre en los servicios base es de otro
+if (["up", "starting"].includes(s.status)) return { st: "other_space", owner: activeProfile };
+if (["other_space", "external"].includes(s.status)) return { st: s.status, owner: s.owner };
+return { st: "down" };
+}
+const stLabel = v => v.st === "other_space" ? (v.owner ? `en uso por ${v.owner}` : "en uso fuera de este espacio") : STATUS[v.st] || v.st;
+// cuanto lleva el trabajo en marcha (desde que lo ve esta pagina)
+const jobSince = {};
+function elapsed(name) {
+const t0 = jobSince[name], s = t0 ? Math.floor((Date.now() - t0) / 1000) : 0;
+return s < 5 ? "" : ` · ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+// avisos de error que el usuario ya ha descartado (solo en este navegador)
+const dismissKey = (name, j) => `${name}|${j.action}|${j.finished || ""}|${j.error || ""}`;
+let dismissed = new Set();
+try { dismissed = new Set(JSON.parse(localStorage.getItem("devws.dismissed") || "[]")); } catch {}
+function dismissJob(name) {
+if (jobs[name]) dismissed.add(dismissKey(name, jobs[name]));
+try { localStorage.setItem("devws.dismissed", JSON.stringify([...dismissed].slice(-50))); } catch {}
+renderProfiles();
+}
+// boton que ahora no se puede usar: se ve apagado y al pulsarlo dice por que
+const offBtn = (cls, label, k, why) => `<button class="${cls} off" data-k="${k}" aria-disabled="true" title="${esc(why)}" data-why="${esc(why)}" onclick="toast(this.dataset.why)">${label}</button>`;
 
 // estado (barato, cada tick) y ramas de los repos (caro: git en cada repo, menos a menudo)
 let reposAt = 0;
 async function refresh() {
+const wasBusy = !!busyJob();
 try {
 const st = await api("/api/state");
 services = st.services; activeProfile = st.active_profile || null;
 wtState = st.worktrees || {}; jobs = st.jobs || {};
+for (const [n, j] of Object.entries(jobs)) if (j.status === "running") jobSince[n] ||= Date.now();
+for (const n of Object.keys(jobSince)) if (!jobs[n] || jobs[n].status !== "running") delete jobSince[n];
 } catch (e) { setActive("err", "sin conexión con el server devws: " + e.message); return; }
 renderActive();
 renderProfiles();
-if (Date.now() - reposAt > 8000 && !busyJob()) refreshRepos();
+// al acabar un trabajo, ramas y worktrees han cambiado: se piden ya
+if (!busyJob() && (wasBusy || Date.now() - reposAt > 8000)) refreshRepos();
 }
 async function refreshRepos() {
 reposAt = Date.now();
@@ -325,25 +391,30 @@ const kick = () => loop();
 // pinta el trabajo como en marcha nada mas pulsar, sin esperar al server
 function optimistic(name, action) {
 jobs[name] = { action, status: "running", step: action === "stop" ? "parando…" : "empezando…" };
+jobSince[name] ||= Date.now();
 renderActive(); renderProfiles();
 }
 
 // ---------------------------------------------------------------- barra superior
-function setActive(cls, html) { $("#active").className = cls; paint($("#activeText"), html); }
+function setActive(cls, html, btns = "") { $("#active").className = cls; paint($("#activeText"), html); paint($("#activeBtns"), btns); }
 function renderActive() {
 const job = busyJob();
 if (job) {
 const [name, j] = job;
-return setActive("busy", `<b>${esc(name)}</b>: ${esc(j.step || "trabajando…")}`
-+ ` <button class="link" data-k="hdr-act" onclick="openLogs('${esc(name)}', 'actividad')">actividad</button>`
+return setActive("busy", `<b>${esc(name)}</b>: ${esc(j.step || "trabajando…")}${elapsed(name)}`,
+`<button class="link" data-k="hdr-act" onclick="openLogs('${esc(name)}', 'actividad')">actividad</button>`
 + (j.action !== "stop" ? ` <button class="stop" data-k="primary" onclick="stopProfile('${esc(name)}')">Parar</button>` : ""));
 }
-const runningProf = Object.values(profiles).find(isRunning);
-if (runningProf) {
-const ids = profSvcs(runningProf).map(n => svcOf(runningProf, n)).filter(Boolean);
-const up = ids.filter(s => s.status === "up").length;
-return setActive("on", `<b>${esc(runningProf.name)}</b> arrancado · ${up}/${profSvcs(runningProf).length} servicios arriba`
-+ ` <button class="stop" data-k="primary" onclick="stopProfile('${esc(runningProf.name)}')">Parar</button>`);
+const prof = (activeProfile && profiles[activeProfile]) || Object.values(profiles).find(isRunning);
+if (prof) {
+const vs = profSvcs(prof).map(n => [n, svcView(prof, n).st]);
+const up = vs.filter(([, s]) => s === "up").length;
+const crashed = vs.filter(([, s]) => s === "crashed").map(([n]) => n);
+const alive = vs.some(([, s]) => ["up", "starting"].includes(s));
+const stop = `<button class="stop" data-k="primary" onclick="stopProfile('${esc(prof.name)}')">Parar</button>`;
+if (!alive && crashed.length) return setActive("err", `<b>${esc(prof.name)}</b>: servicios caídos (${esc(crashed.join(", "))})`, stop);
+if (alive) return setActive(up < vs.length ? "warn" : "on", `<b>${esc(prof.name)}</b> arrancado · ${up}/${vs.length} arriba`
++ (crashed.length ? ` · caído: ${esc(crashed.join(", "))}` : ""), stop);
 }
 const loose = services.filter(s => ["up", "starting"].includes(s.status) && s.pid);
 if (loose.length) return setActive("on", `servicios sueltos arriba: ${loose.map(s => esc(s.id)).join(", ")}`);
@@ -351,98 +422,159 @@ setActive("", "nada arrancado");
 }
 
 // ---------------------------------------------------------------- tarjetas
+// Tarjeta de un espacio: una fila por repo con donde corre (worktree, solo
+// lectura u original), su rama real (y la que pide el perfil si es otra), sus
+// cambios sin commitear y sus servicios con su estado.
+let branchEdit = null;  // "espacio|repo" con el desplegable para cambiar la rama del original
+function svcHtml(p, n, active, working) {
+const v = svcView(p, n), d = svcDef(n), id = esc(svcId(p, n)), k = esc(n);
+const cls = { up: "up", starting: "starting", crashed: "err", external: "warn", other_space: "muted" }[v.st] || "";
+const link = (label, action, key, title, extra = "") => `<button class="link${extra}" data-k="${key}:${k}" onclick="${action}" title="${title}">${label}</button>`;
+const acts = [];
+if (v.st === "up") acts.push(`<a href="http://127.0.0.1:${d.port}" target="_blank" class="hint" data-k="o:${k}">abrir</a>`);
+// solo el espacio activo toca sus servicios: desde otra tarjeta pararia el activo
+if (active && !working) {
+if (["up", "starting"].includes(v.st)) acts.push(link("reiniciar", `svcRestart('${id}')`, "r", "lo para y lo vuelve a arrancar"),
+link("parar", `svcStop('${id}')`, "s", "para solo este servicio", " danger"));
+else if (["down", "crashed"].includes(v.st)) acts.push(link("arrancar", `svcStart('${id}')`, "a", "arranca solo este servicio"));
+}
+if (v.st === "crashed") acts.push(link("log", `openLogs('${esc(p.name)}','${id}')`, "l", "ver su log"));
+const why = v.st === "external" ? ` title="otro programa usa el puerto :${d.port}; al arrancar, devws lo para si es de desarrollo"` : "";
+return `<div class="svc"><span class="svc-n">${k} <span class="hint">:${d.port || "?"}</span></span>`
++ `<span class="badge ${cls}"${why}>${esc(stLabel(v))}</span>${acts.join("")}</div>`
++ (v.st === "crashed" && v.s && v.s.last_line ? `<div class="svc-why" title="${esc(v.s.last_line)}">${esc(v.s.last_line)}</div>` : "");
+}
+function origBranchSelect(r) {
+const ri = repoOf(r);
+return `<select class="p-branch" data-k="chgsel:${esc(r)}" data-repo="${esc(r)}" data-current="${esc(ri.current || "")}"
+aria-label="rama de ${esc(r)} en su carpeta original" onchange="branchEdit=null;checkout(this)" onblur="branchEdit=null;setTimeout(renderProfiles)">
+${ri.current ? "" : '<option value="" selected>(sin rama)</option>'}
+${(ri.branches || []).map(b => `<option value="${esc(b)}" ${b === ri.current ? "selected" : ""}>${esc(b)}</option>`).join("")}
+</select>`;
+}
+function editOrigBranch(prof, r) {
+branchEdit = `${prof}|${r}`;
+renderProfiles();
+const s = $("#profilesList").querySelector(`[data-p="${CSS.escape(prof)}"] [data-k="chgsel:${CSS.escape(r)}"]`);
+if (s) s.focus();
+}
+function repoRows(p, active, working) {
+const wt = p.worktree === true, pr = p.repos || {}, bases = p.bases || {}, ro = p.readonly || [];
+const pending = new Set((wtState[p.name] || {}).pending || []);
+const psv = profSvcs(p);
+// primero los repos con servicios, en orden de arranque; luego los del perfil sin servicios
+const order = [];
+for (const n of psv) { const r = svcDef(n).repo; if (r && !order.includes(r)) order.push(r); }
+for (const r of Object.keys(pr)) if (!order.includes(r)) order.push(r);
+const again = active ? "volver a " : "";
+const code = b => `<code>${esc(b)}</code>`;
+const rows = order.map(r => {
+const ri = repoOf(r), want = pr[r], inProf = want !== undefined, notes = [];
+let where, br;
+if (wt && inProf) {
+const w = (ri.worktrees || {})[p.name];
+if (ro.includes(r)) {
+where = '<span class="badge ro" title="worktree en lo último de la rama sin abrirla: otros espacios pueden usarla a la vez. No hagas commits ahí.">solo lectura</span>';
+br = code(want) + (!w ? ' <span class="hint">· se crea al arrancar</span>'
+: pending.has(r) ? ` <span class="warn-t">· se actualiza al ${again}arrancar</span>` : ' <span class="hint">· al día</span>');
+} else {
+where = '<span class="badge wt" title="carpeta propia del espacio: tus repos no se tocan">worktree</span>';
+const isNew = bases[r] && !(ri.branches || []).includes(want);
+if (!w) br = code(want) + ` <span class="hint">· se crea al arrancar${isNew ? ` desde ${esc(bases[r])}` : ""}</span>`;
+else if (w.branch !== want) { br = `${code(w.branch || "sin rama")} → ${code(want)}`; notes.push(`pasará a ${esc(want)} al ${again}arrancar`); }
+else br = code(want);
+}
+if (w && w.dirty) notes.push(`${w.dirty} fichero${w.dirty === 1 ? "" : "s"} sin commitear en worktrees/${esc(p.name)}__${esc(r)}`
++ (w.branch !== want && !ro.includes(r) ? ": no podrá cambiar de rama hasta que hagas commit o stash" : ""));
+} else {
+where = `<span class="badge" title="corre desde ${esc(r)} tal cual está en tu carpeta">original</span>`;
+const cur = ri.current;
+if (inProf && cur !== want) {
+br = `${code(cur || "sin rama")} → ${code(want)}`;
+notes.push(`checkout a ${esc(want)} al ${again}arrancar` + (ri.dirty ? ": fallará, la carpeta tiene cambios sin commitear" : ""));
+} else if (branchEdit === `${p.name}|${r}`) br = origBranchSelect(r);
+else br = code(cur || "sin rama") + (ri.dirty ? ' <span class="hint">· cambios sin commitear</span>' : "")
++ (wt && !working ? ` <button class="link sm" data-k="chg:${esc(r)}" onclick="editOrigBranch('${esc(p.name)}','${esc(r)}')" title="cambia la rama de la carpeta original de ${esc(r)} (checkout)">cambiar</button>` : "");
+}
+const svcs = psv.filter(n => svcDef(n).repo === r);
+const cell = svcs.length ? svcs.map(n => svcHtml(p, n, active, working)).join("")
+: `<span class="hint">${ri.startup === "library" ? "librería" : ri.startup ? "no arranca en este espacio" : ri.name ? "sin arranque configurado" : ""}</span>`;
+return `<div class="td repo">${esc(r)}</div><div class="td">${where}</div><div class="td">${br}</div><div class="td">${cell}</div>`
++ (notes.length ? `<div class="note">⚠ ${notes.join(" · ")}</div>` : "");
+}).join("");
+const others = repos.filter(x => !x.error && !order.includes(x.name));
+return `<div class="p-table"><div class="th">Repo</div><div class="th">Dónde</div><div class="th">Rama</div><div class="th">Servicios</div>${rows}</div>`
++ (others.length ? `<div class="p-others hint">${wt ? "Fuera del espacio y sin servicios aquí" : "No se tocan"}: ${others.map(x => `${esc(x.name)} <code>${esc(x.current || "sin rama")}</code>`).join(" · ")}</div>` : "");
+}
+
 function profileCard(p) {
 const wt = p.worktree === true;
 const job = jobs[p.name];
 const working = job && job.status === "running";
 const running = isRunning(p);
-const anyBusy = !!busyJob();
-const pr = p.repos || {};
-const bases = p.bases || {};
-const ro = p.readonly || [];
+const active = isActive(p);
+const busy = busyJob();
 const wts = wtState[p.name];
+const psv = profSvcs(p);
+const nm = esc(p.name);
 
 const mode = wt
-? `<b>Worktrees aislados</b> · ${wts ? "creados en .devws/worktrees" : "se crean al arrancar"} · tus repos no se tocan`
-: `<b>Repos originales</b> · al arrancar hace checkout de estas ramas`;
+? `<b>Worktrees</b> en worktrees/${nm}__&lt;repo&gt; · los repos de fuera corren desde su carpeta original`
+: `<b>Repos originales</b> · al arrancar hace checkout de estas ramas en tus carpetas`;
 
-const repoLines = Object.keys(pr).length
-? Object.entries(pr).map(([r, b]) => `<div class="p-line"><span class="k">${esc(r)}</span><code>${esc(b)}</code>`
-+ (ro.includes(r) ? ' <span class="badge" title="worktree en lo último de la rama sin abrirla: otros espacios pueden usarla a la vez">solo lectura</span>' : "")
-+ (!ro.includes(r) && bases[r] && !(repos.find(x => x.name === r) || {}).branches?.includes(b) ? ` <span class="hint">nueva desde ${esc(bases[r])}</span>` : "")
-+ `</div>`).join("")
-: `<div class="p-line hint">ningún repo incluido</div>`;
-// worktree: el resto de repos estan en su carpeta original; se ve su rama y se
-// puede cambiar (checkout en el original). Primero los que corren aqui.
-let rest = "";
-if (wt) {
-const runsHere = {};
-for (const n of profSvcs(p)) {
-const r = (services.find(x => x.name === n) || {}).repo;
-if (r && pr[r] === undefined) (runsHere[r] = runsHere[r] || []).push(n);
+// zona de estado: lo que esta haciendo, o como acabo lo ultimo (con su hora)
+const lines = [];
+const act = `<a href="#" data-k="act" onclick="openLogs('${nm}','actividad');return false">ver actividad</a>`;
+const when = job && job.finished ? ` (${esc(job.finished)})` : "";
+if (working) lines.push(["busy", `${esc(job.step || "trabajando…")}${elapsed(p.name)} ${act}`]);
+else if (job && job.status === "cancelled") lines.push(["warn", `${({ prepare: "Preparación cortada", install: "Instalación cortada" })[job.action] || "Arranque cortado"} al pulsar Parar${when}. ${act}`]);
+else if (job && job.status === "error" && !dismissed.has(dismissKey(p.name, job))) {
+// un error de arranque ya resuelto (todo arriba) no se sigue enseñando
+const allUp = psv.length && psv.every(n => svcView(p, n).st === "up");
+if (!(job.action === "start" && allUp)) {
+const what = running && job.action === "start" ? "Arrancado con problemas"
+: ({ stop: "Error al parar", prepare: "Error al preparar", install: "Error al instalar dependencias" })[job.action] || "Error al arrancar";
+lines.push([running ? "warn" : "err", `${what}${when}: ${esc(job.error)} ${act}`
++ ` <button class="link x" data-k="dismiss" onclick="dismissJob('${nm}')" title="ocultar este aviso" aria-label="ocultar este aviso">×</button>`]);
 }
-const others = repos.filter(r => !r.error && pr[r.name] === undefined)
-.sort((a, b) => !!runsHere[b.name] - !!runsHere[a.name]);
-rest = others.length ? `<div class="sect">Desde su carpeta original</div>` + others.map(r => `<div class="p-line">
-<span class="k">${esc(r.name)}</span>
-<select class="p-branch" data-k="br:${esc(r.name)}" aria-label="rama de ${esc(r.name)} en su carpeta original" data-repo="${esc(r.name)}" data-current="${esc(r.current || "")}" onchange="checkout(this)">
-${r.current ? "" : '<option value="" selected>(sin rama)</option>'}
-${r.branches.map(b => `<option value="${esc(b)}" ${b === r.current ? "selected" : ""}>${esc(b)}</option>`).join("")}
-</select>
-${r.dirty ? '<span class="badge dirty">cambios sin commitear</span>' : ""}
-<span class="hint">${runsHere[r.name] ? `corre aquí: ${esc(runsHere[r.name].join(", "))}` : "no arranca en este espacio"}</span>
-</div>`).join("") : "";
 }
+const problems = running && (lines.some(([c]) => c !== "busy") || psv.some(n => ["down", "crashed"].includes(svcView(p, n).st)));
 
-const svcLines = profSvcs(p).map(n => {
-const s = svcOf(p, n);
-const def = services.find(x => x.name === n) || {};
-const status = s ? s.status : "down";
-const where = wt ? (pr[def.repo] !== undefined ? '<span class="badge wt">worktree</span>' : '<span class="badge">original</span>') : "";
-return `<div class="p-line"><span class="k">${esc(n)} <span class="hint">:${def.port || "?"}</span></span>
-${where}<span class="badge ${status}">${STATUS[status] || status}</span>
-${status === "up" ? `<a href="http://127.0.0.1:${def.port}" target="_blank" class="hint" data-k="o:${esc(n)}">abrir</a>` : ""}
-<span style="flex:1"></span>
-${s && status !== "down" && !working ? `<button class="link" data-k="r:${esc(n)}" onclick="svcRestart('${esc(s.id)}')" title="baja y relanza este servicio">relanzar</button>` : ""}
-${s && ["up", "starting"].includes(status) ? `<button class="link danger" data-k="s:${esc(n)}" onclick="svcStop('${esc(s.id)}')" title="para solo este servicio">parar</button>` : ""}
-</div>`;
-}).join("");
-
-let statusLine = "";
-if (working) statusLine = `<div class="status-line busy">${esc(job.step || "trabajando…")} <a href="#" data-k="act" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
-else if (job && job.status === "cancelled") statusLine = `<div class="status-line warn">${({ prepare: "Preparación cortada", install: "Instalación cortada" })[job.action] || "Arranque cortado"} al pulsar Parar. <a href="#" data-k="act" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
-else if (job && job.status === "error") statusLine = `<div class="status-line err">${({ stop: "Error al parar", prepare: "Error al preparar", install: "Error al instalar dependencias" })[job.action] || "Error al arrancar"}: ${esc(job.error)} <a href="#" data-k="act" onclick="openLogs('${esc(p.name)}','actividad');return false">ver actividad</a></div>`;
-else if (wt && wts && (wts.pending || []).length) statusLine = `<div class="status-line warn">${esc(wts.pending.join(", "))}: el perfil pide otra rama; se aplica al ${running ? "volver a " : ""}arrancar</div>`;
-
-const nm = esc(p.name);
-// Parar se puede pulsar siempre: si esta arrancando (o preparando) lo corta
+// acciones; las que ahora no se pueden usar dicen por que
+const wait = "Espera a que termine lo que está haciendo";
 const stopping = working && job.action === "stop";
 const primary = stopping
 ? `<button class="stop" data-k="primary" disabled>Parando…</button>`
 : running || working
 ? `<button class="stop" data-k="primary" onclick="stopProfile('${nm}')" title="${working ? "corta lo que está haciendo y para lo que ya haya arrancado" : "para los servicios del espacio"}">Parar</button>`
-: `<button class="primary" data-k="primary" ${anyBusy ? "disabled" : ""} onclick="startProfile('${nm}')">Arrancar</button>`;
-const wtBtns = wt && wts ? `<button class="link" data-k="vscode" onclick="wtOpen('${nm}')" title="abre en VS Code las carpetas de este espacio">VS Code</button>
-<button class="link" data-k="rmwt" ${working || running ? "disabled" : ""} onclick="wtRemove('${nm}')" title="borra las carpetas de worktree (las ramas se conservan; se recrean al arrancar)">borrar worktrees</button>` : "";
+: busy ? offBtn("primary", "Arrancar", "primary", `Espera: ${busy[0]} está ${({ start: "arrancando", stop: "parando", prepare: "preparando sus worktrees", install: "instalando dependencias" })[busy[1].action] || "trabajando"}`)
+: `<button class="primary" data-k="primary" onclick="startProfile('${nm}')">Arrancar</button>`;
+const edit = working ? offBtn("link", "editar", "edit", wait) : `<button class="link" data-k="edit" onclick="openProfileForm('${nm}')">editar</button>`;
+const rmwt = working ? offBtn("link", "borrar worktrees", "rmwt", wait)
+: running ? offBtn("link", "borrar worktrees", "rmwt", "Para el espacio antes de borrar sus carpetas")
+: `<button class="link" data-k="rmwt" onclick="wtRemove('${nm}')" title="borra las carpetas de worktree (las ramas se conservan; se recrean al arrancar)">borrar worktrees</button>`;
+const del = working ? offBtn("link danger", "eliminar", "del", wait)
+: running ? offBtn("link danger", "eliminar", "del", "Para el espacio antes de eliminarlo")
+: `<button class="link danger" data-k="del" onclick="deleteProfile('${nm}')">eliminar</button>`;
+const wtBtns = wt && wts ? `<button class="link" data-k="vscode" onclick="wtOpen('${nm}')" title="abre en VS Code las carpetas de este espacio">VS Code</button>${rmwt}` : "";
 
-return `<div class="p-card ${working ? "busy" : running ? "running" : ""}">
-<h3>${nm} ${running ? '<span class="badge up">arrancado</span>' : ""} ${working ? '<span class="badge starting">trabajando</span>' : ""}</h3>
+return {
+cls: working ? "busy" : problems ? "warnb" : running ? "running" : "",
+main: `<h3>${nm} ${running && !working ? `<span class="badge ${problems ? "warn" : "up"}">arrancado</span>` : ""} ${working ? '<span class="badge starting">trabajando</span>' : ""}</h3>
 <div class="mode">${mode}</div>
-<div class="sect">Ramas</div>${repoLines}${rest}
-<div class="sect">Servicios (en orden de arranque)</div>${svcLines || '<div class="p-line hint">sin servicios</div>'}
-${statusLine}
-<div class="p-actions">
-${primary}
+${repoRows(p, active, working)}`,
+status: lines.map(([c, h]) => `<div class="status-line ${c}">${h}</div>`).join(""),
+actions: `${primary}
 <button class="link" data-k="logs" onclick="openLogs('${nm}')">logs</button>
-<button class="link" data-k="edit" ${working ? "disabled" : ""} onclick="openProfileForm('${nm}')">editar</button>
+${edit}
 ${wtBtns}
 <span style="flex:1"></span>
-<button class="link danger" data-k="del" ${working || running ? "disabled" : ""} onclick="deleteProfile('${nm}')">eliminar</button>
-</div>
-</div>`;
+${del}`,
+};
 }
 
-// una caja por espacio: solo se repinta la tarjeta cuyo HTML cambia
+// una caja por espacio, en tres zonas (contenido, estado, botones): solo se
+// repinta la que cambia; asi el paso de un trabajo no rehace el boton Parar
 function renderProfiles() {
 const host = $("#profilesList"), a = document.activeElement;
 // no repintar mientras se elige en un desplegable de una tarjeta
@@ -453,9 +585,14 @@ host._html = null;
 for (const el of [...host.children]) if (!el.dataset.p || !profiles[el.dataset.p]) el.remove();
 list.forEach((p, i) => {
 let el = [...host.children].find(x => x.dataset.p === p.name);
-if (!el) { el = document.createElement("div"); el.dataset.p = p.name; }
+if (!el) {
+el = document.createElement("div"); el.dataset.p = p.name;
+el.innerHTML = '<div class="p-card"><div></div><div></div><div class="p-actions"></div></div>';
+}
 if (host.children[i] !== el) host.insertBefore(el, host.children[i] || null);
-paint(el, profileCard(p));
+const c = profileCard(p), card = el.firstElementChild;
+card.className = `p-card ${c.cls}`;
+paint(card.children[0], c.main); paint(card.children[1], c.status); paint(card.children[2], c.actions);
 });
 }
 
@@ -489,12 +626,21 @@ async function svcStop(id) {
 try { await post(svcUrl(id, "down")); } catch (e) { toast(e.message, true); }
 kick();
 }
+// sin force: con force, api_up para los servicios de otro espacio. La UI solo
+// ofrece estas acciones en el espacio activo, asi que no hace falta
 async function svcRestart(id) {
 try {
 await post(svcUrl(id, "down"));
 kick();
-const r = await post(svcUrl(id, "up") + "?force=true");
-toast(`${id}: ${r.msg || r.warn || "ok"}`, !!(r.warn || r.error));
+const r = await post(svcUrl(id, "up"));
+toast(`${id}: ${r.msg || r.warn || "ok"}`, !r.ok || !!r.warn);
+} catch (e) { toast(e.message, true); }
+kick();
+}
+async function svcStart(id) {
+try {
+const r = await post(svcUrl(id, "up"));
+toast(`${id}: ${r.msg || r.warn || "arrancado"}`, !r.ok || !!r.warn);
 } catch (e) { toast(e.message, true); }
 kick();
 }

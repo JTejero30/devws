@@ -527,7 +527,7 @@ def test_error_al_arrancar_se_ve_en_el_trabajo(ws):
     c = ws["c"]
     c.post("/api/profiles", {"name": "roto", "repos": {"api": "main"}, "worktree": True})
     j = (c.post("/api/profiles/roto/start"), wait_job(c, "roto", expect="error"))[1]
-    assert "ya está abierta" in j["error"], j
+    assert "ya está abierta" in j["error"] and j["finished"], "con la hora a la que acabo"
     assert c.get("/api/state")["active_profile"] is None
     assert all(s["status"] == "down" for s in c.get("/api/state")["services"]), "no arranca servicios si falla"
     c.delete("/api/profiles/roto")

@@ -1705,7 +1705,7 @@ def run_job(profile: str, action: str, append: bool = False) -> None:
     with _job_lock:
         nxt, _stop_after = _stop_after, None
         _set_job(profile, action=action, status="cancelled" if cancelled else "error" if errors else "ok",
-                 error="; ".join(errors) or None)
+                 error="; ".join(errors) or None, finished=time.strftime("%H:%M"))
         if nxt:  # se pidio parar mientras trabajaba: ahora toca parar
             _set_job(nxt, action="stop", status="running", step="parando…")
             _launch_job(nxt, "stop", append=True)
