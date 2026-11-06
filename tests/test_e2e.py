@@ -522,6 +522,31 @@ def test_error_al_arrancar_se_ve_en_el_trabajo(ws):
     c.delete("/api/profiles/roto")
 
 
+def test_repos_dicen_donde_esta_abierta_cada_rama(ws):
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    c.post("/api/profiles", {"name": "abiertas", "repos": {"api": "feat-a"}, "worktree": True})
+    prepare(c, "abiertas")
+    api = {r["name"]: r for r in c.get("/api/repos")}["api"]
+    assert api["open"]["main"] == {"where": "original"}
+    assert api["open"]["feat-a"] == {"where": "space", "space": "abiertas"}
+    assert api["worktrees"] == {"abiertas": {"branch": "feat-a", "dirty": 0}}
+    (dws / "worktrees" / "abiertas__api" / "sucio.txt").write_text("x")
+    assert {r["name"]: r for r in c.get("/api/repos")}["api"]["worktrees"]["abiertas"]["dirty"] == 1
+
+    # checkout en el original de una rama abierta en un worktree: en español y sin rutas
+    [r] = c.post("/api/checkout", {"items": [{"repo": "api", "branch": "feat-a"}]})
+    assert not r["ok"] and r["error"] == "la rama feat-a ya está abierta en el espacio abiertas", r
+    # original con cambios sin commitear
+    (root / "api" / "sucio.txt").write_text("x")
+    try:
+        [r] = c.post("/api/checkout", {"items": [{"repo": "api", "branch": "otra"}]})
+        assert not r["ok"] and "cambios sin commitear en su carpeta original" in r["error"], r
+    finally:
+        (root / "api" / "sucio.txt").unlink()
+    c.delete("/api/worktrees/abiertas?force=true")
+    c.delete("/api/profiles/abiertas")
+
+
 def mcp_rpc(c: Client, method: str, params: dict | None = None) -> dict:
     """JSON-RPC contra /mcp como lo haria un cliente MCP (Copilot): sin Origin."""
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}).encode()

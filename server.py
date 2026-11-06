@@ -290,12 +290,40 @@ def repo_status(name: str) -> dict:
     remote = [b.replace("origin/", "").strip()
               for b in git(p, "branch", "-r", "--format=%(refname:short)").split()
               if b.startswith("origin/") and "HEAD" not in b]
+    open_at, wts = repo_worktrees(name, p)
     return {
         "name": name,
         "current": current or None,
         "dirty": dirty,
         "branches": sorted(set(local) | set(remote)),
+        "open": open_at,
+        "worktrees": wts,
     }
+
+
+def repo_worktrees(name: str, p: Path) -> tuple[dict, dict]:
+    """(rama -> donde esta abierta, espacio -> estado de su worktree), segun git
+    worktree list. Donde: {"where": "original"}, {"where": "space", "space": ...}
+    o {"where": "other", "dir": ...}. Estado: rama real (None si detached, como
+    en solo lectura) y ficheros sin commitear."""
+    open_at, wts = {}, {}
+    for block in git(p, "worktree", "list", "--porcelain").split("\n\n"):
+        info = dict(line.partition(" ")[::2] for line in block.splitlines() if line)
+        if "worktree" not in info or "prunable" in info:
+            continue
+        d = Path(info["worktree"]).resolve()
+        branch = info["branch"].removeprefix("refs/heads/") if "branch" in info else None
+        prof, _, rname = d.name.partition("__")
+        if d == p:
+            where = {"where": "original"}
+        elif d.parent == WT_DIR.resolve() and rname == name:
+            where = {"where": "space", "space": prof}
+            wts[prof] = {"branch": branch, "dirty": wt_dirty(d)}
+        else:
+            where = {"where": "other", "dir": place(d)}
+        if branch:
+            open_at[branch] = where
+    return open_at, wts
 
 
 @app.get("/api/repos")
