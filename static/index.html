@@ -100,6 +100,11 @@ button.primary.off, button.primary.off:hover { background:#1f6feb40; border-colo
 .p-form .row { align-items:center; }
 .p-form .row > label:first-child { width:200px; color:var(--dim); font-size:12px; }
 .opt { display:flex; gap:8px; align-items:flex-start; padding:4px 0; cursor:pointer; }
+.pf-warn { width:100%; padding-left:210px; color:var(--yellow); font-size:12px; }
+.pf-warn:empty { display:none; }
+.pf-warn > div + div { margin-top:4px; }
+.pf-fix { display:inline-flex; flex-wrap:wrap; gap:2px 6px; margin-left:6px; }
+.pf-fix button.link { color:var(--accent); padding:0 2px; font-size:12px; }
 .opt input { margin-top:4px; }
 .empty { color:var(--dim); padding:10px 0; }
 #toast { position:fixed; bottom:20px; right:20px; background:#21262d; border:1px solid var(--border);
@@ -168,9 +173,9 @@ white-space:pre-wrap; word-break:break-all; color:#c9d1d9; }
 <div class="row"><label for="pfName">Nombre</label><input type="text" id="pfName" placeholder="ej: mi-feature"></div>
 <div class="row" style="align-items:flex-start"><label>Dónde trabajar</label>
 <div>
-<label class="opt"><input type="radio" name="pfMode" value="wt" checked>
+<label class="opt"><input type="radio" name="pfMode" value="wt" checked onchange="pfRefreshAll()">
 <span>En <b>worktrees aislados</b><br><span class="hint">Cada repo incluido se abre en su propia carpeta para este espacio. No toca tus repos ni sus ramas. Recomendado.</span></span></label>
-<label class="opt"><input type="radio" name="pfMode" value="inplace">
+<label class="opt"><input type="radio" name="pfMode" value="inplace" onchange="pfRefreshAll()">
 <span>En los <b>repos originales</b><br><span class="hint">Hace checkout de las ramas elegidas en tus carpetas de siempre.</span></span></label>
 </div></div>
 <div id="pfRepos"></div>
@@ -328,6 +333,21 @@ if (["up", "starting"].includes(s.status)) return { st: "other_space", owner: ac
 if (["other_space", "external"].includes(s.status)) return { st: s.status, owner: s.owner };
 return { st: "down" };
 }
+// Donde esta abierta la rama b del repo r, si eso impide usarla aqui (git no deja
+// abrir una rama en dos sitios). mode "wt": en el worktree del espacio `space`;
+// "orig": en la carpeta original del repo (checkout o espacio in-place).
+function openAt(r, b, mode, space = null) {
+const o = (repoOf(r).open || {})[b];
+if (!o) return null;
+if (o.where === "space") return mode === "wt" && o.space === space ? null : `el espacio ${o.space}`;
+if (o.where === "original") return mode === "wt" ? "la carpeta original" : null;
+return o.dir;
+}
+// opciones de rama para la carpeta original: las abiertas en otro sitio no se pueden elegir
+const origOptions = (r, cur) => (repoOf(r).branches || []).map(b => {
+const w = openAt(r, b, "orig");
+return `<option value="${esc(b)}" ${b === cur ? "selected" : ""} ${w ? "disabled" : ""}>${esc(b)}${w ? ` · abierta en ${esc(w)}` : ""}</option>`;
+}).join("");
 const stLabel = v => v.st === "other_space" ? (v.owner ? `en uso por ${v.owner}` : "en uso fuera de este espacio") : STATUS[v.st] || v.st;
 // cuanto lleva el trabajo en marcha (desde que lo ve esta pagina)
 const jobSince = {};
@@ -449,7 +469,7 @@ const ri = repoOf(r);
 return `<select class="p-branch" data-k="chgsel:${esc(r)}" data-repo="${esc(r)}" data-current="${esc(ri.current || "")}"
 aria-label="rama de ${esc(r)} en su carpeta original" onchange="branchEdit=null;checkout(this)" onblur="branchEdit=null;setTimeout(renderProfiles)">
 ${ri.current ? "" : '<option value="" selected>(sin rama)</option>'}
-${(ri.branches || []).map(b => `<option value="${esc(b)}" ${b === ri.current ? "selected" : ""}>${esc(b)}</option>`).join("")}
+${origOptions(r, ri.current)}
 </select>`;
 }
 function editOrigBranch(prof, r) {
@@ -719,6 +739,8 @@ formSvcSelected = new Set(cur);
 renderFormServices();
 $("#profileForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
 if (!name) $("#pfName").focus();
+// los avisos dependen de donde esta abierta cada rama ahora: se piden y se repasan
+refreshRepos().then(pfRefreshAll);
 }
 
 // cada repo: no incluir | rama existente | rama nueva desde una base
@@ -732,26 +754,71 @@ const cur = current[r.name] || "";
 const isNew = !!cur && !branches.includes(cur);
 const base = bases[r.name] || ["develop", "main", "master"].find(b => branches.includes(b)) || r.current;
 return `<div class="row">
-<label>${esc(r.name)}</label>
-<select data-pfrepo="${esc(r.name)}" onchange="pfRepoChange(this)">
+<label for="pf-${esc(r.name)}">${esc(r.name)}</label>
+<select id="pf-${esc(r.name)}" data-pfrepo="${esc(r.name)}" onchange="pfRepoChange(this)">
 <option value="">— no incluir —</option>
-${branches.map(b => `<option value="${esc(b)}" ${b === cur ? "selected" : ""}>${esc(b)}</option>`).join("")}
+${branches.map(b => `<option value="${esc(b)}" data-b="${esc(b)}" ${b === cur ? "selected" : ""}>${esc(b)}</option>`).join("")}
 <option value="__new" ${isNew ? "selected" : ""}>+ rama nueva…</option>
 </select>
 <label class="pf-ro" style="display:${cur && !isNew ? "inline-flex" : "none"};width:auto;gap:4px;align-items:center"
 title="Para repos en los que no vas a desarrollar (p. ej. un servicio en desa): el worktree se queda en lo último de la rama sin abrirla, así otros espacios pueden usar la misma rama a la vez. No hagas commits ahí.">
-<input type="checkbox" data-pfro="${esc(r.name)}" ${readonly.includes(r.name) ? "checked" : ""}> solo lectura</label>
+<input type="checkbox" data-pfro="${esc(r.name)}" ${readonly.includes(r.name) ? "checked" : ""} onchange="pfRefresh(this.closest('.row'))"> solo lectura</label>
 <span class="pf-new" style="display:${isNew ? "flex" : "none"};gap:6px;align-items:center;width:100%;padding-left:210px">
-<input type="text" data-pfnew="${esc(r.name)}" placeholder="nombre de la rama nueva" value="${isNew ? esc(cur) : ""}">
+<input type="text" data-pfnew="${esc(r.name)}" aria-label="nombre de la rama nueva" placeholder="nombre de la rama nueva" value="${isNew ? esc(cur) : ""}" oninput="pfRefresh(this.closest('.row'))">
 <span class="hint">a partir de</span>
-<select data-pfbase="${esc(r.name)}">${branches.map(b => `<option value="${esc(b)}" ${b === base ? "selected" : ""}>${esc(b)}</option>`).join("")}</select>
+<select data-pfbase="${esc(r.name)}" aria-label="rama de partida">${branches.map(b => `<option value="${esc(b)}" ${b === base ? "selected" : ""}>${esc(b)}</option>`).join("")}</select>
 </span>
+<div class="pf-warn" role="status"></div>
 </div>`;
 }).join("");
+pfRefreshAll();
 }
-function pfRepoChange(sel) {
-sel.parentElement.querySelector(".pf-new").style.display = sel.value === "__new" ? "flex" : "none";
-sel.parentElement.querySelector(".pf-ro").style.display = sel.value && sel.value !== "__new" ? "inline-flex" : "none";
+function pfRepoChange(sel) { pfRefresh(sel.closest(".row")); }
+const pfMode = () => document.querySelector("input[name=pfMode]:checked").value;
+function pfRefreshAll() { document.querySelectorAll("#pfRepos .row").forEach(pfRefresh); }
+// Repasa una fila del formulario: que opciones estan abiertas en otro sitio y,
+// si la elegida lo esta (o el worktree tiene cambios que impediran cambiarlo de
+// rama), lo dice en linea con las salidas posibles, antes de guardar
+function pfRefresh(row) {
+const sel = row.querySelector("[data-pfrepo]"), r = sel.dataset.pfrepo, ri = repoOf(r), wt = pfMode() === "wt";
+const val = sel.value, ro = row.querySelector("[data-pfro]");
+for (const o of sel.querySelectorAll("option[data-b]")) {
+const w = openAt(r, o.dataset.b, wt ? "wt" : "orig", editingProfile);
+o.textContent = o.dataset.b + (w ? ` · abierta en ${w}` : "");
+}
+row.querySelector(".pf-new").style.display = val === "__new" ? "flex" : "none";
+row.querySelector(".pf-ro").style.display = wt && val && val !== "__new" ? "inline-flex" : "none";
+const want = val === "__new" ? row.querySelector("[data-pfnew]").value.trim() : val;
+const where = val && val !== "__new" && !(wt && ro.checked) ? openAt(r, val, wt ? "wt" : "orig", editingProfile) : null;
+const msgs = [];
+if (where) {
+const fix = (how, label) => `<button type="button" class="link" onclick="pfFix(this,'${how}')">${label}</button>`;
+msgs.push(`⚠ ${esc(val)} ya está abierta en ${esc(where)}: git no deja abrir una rama en dos sitios y el arranque fallaría.`
++ `<span class="pf-fix">${wt ? fix("ro", "usar en solo lectura") : ""}${fix("new", `rama nueva desde ${esc(val)}`)}`
++ fix("out", where === "la carpeta original" ? `no incluir (corre desde el original, ya en ${esc(val)})` : "no incluir") + "</span>");
+}
+// cambios sin commitear que impediran el cambio de rama al arrancar
+const w = wt && editingProfile ? (ri.worktrees || {})[editingProfile] : null;
+if (w && w.dirty && want && w.branch !== want && !(ro.checked && val !== "__new"))
+msgs.push(`⚠ El worktree tiene ${w.dirty} fichero${w.dirty === 1 ? "" : "s"} sin commitear: al arrancar no podrá pasar de ${esc(w.branch || "detached")} a ${esc(want)}. Haz commit o stash antes en worktrees/${esc(editingProfile)}__${esc(r)}.`);
+if (!wt && want && ri.dirty && ri.current !== want)
+msgs.push(`⚠ ${esc(r)} tiene cambios sin commitear en su carpeta original: el checkout a ${esc(want)} fallará hasta que hagas commit o stash.`);
+const box = row.querySelector(".pf-warn");
+box.innerHTML = msgs.map(m => `<div>${m}</div>`).join("");
+box.dataset.conflict = where ? `${r} (${val} en ${where})` : "";
+}
+function pfFix(btn, how) {
+const row = btn.closest(".row"), sel = row.querySelector("[data-pfrepo]"), b = sel.value;
+if (how === "ro") row.querySelector("[data-pfro]").checked = true;
+else if (how === "out") sel.value = "";
+else {
+sel.value = "__new";
+row.querySelector("[data-pfbase]").value = b;
+const n = row.querySelector("[data-pfnew]");
+if (!n.value) n.value = `${b}-${$("#pfName").value.trim() || editingProfile || "nueva"}`;
+}
+pfRefresh(row);
+(how === "new" ? row.querySelector("[data-pfnew]") : sel).focus();
 }
 
 function renderFormServices() {
@@ -799,6 +866,8 @@ async function saveProfile() {
 const p = formPayload();
 if (!p.name) return toast("ponle un nombre al espacio", true);
 if (!Object.keys(p.repos).length && !confirm("No has incluido ningún repo: los servicios correrán tal cual están. ¿Guardar igualmente?")) return;
+const busy = [...document.querySelectorAll("#pfRepos .pf-warn")].map(b => b.dataset.conflict).filter(Boolean);
+if (busy.length && !confirm(`Ramas abiertas en otro sitio: ${busy.join(", ")}.\n\nEl arranque fallará mientras sigan abiertas allí. ¿Guardar igualmente?`)) return;
 try {
 await api("/api/profiles", { method: editingProfile ? "PUT" : "POST",
 headers: { "Content-Type": "application/json" }, body: JSON.stringify(p) });
@@ -826,7 +895,7 @@ paint(host, repos.map(r => r.error
 : `<div class="row" data-repo="${esc(r.name)}">
 <span class="name">${esc(r.name)} <span class="hint" style="font-weight:400">${esc(r.kind)}</span></span>
 <select onchange="checkout(this)" data-k="sel:${esc(r.name)}" aria-label="rama de ${esc(r.name)} en su carpeta original" data-current="${esc(r.current || "")}">
-${r.branches.map(b => `<option value="${esc(b)}" ${b === r.current ? "selected" : ""}>${esc(b)}</option>`).join("")}
+${origOptions(r.name, r.current)}
 </select>
 ${r.dirty ? '<span class="badge dirty">cambios sin commitear</span>' : ""}
 ${r.startup === "library" ? '<span class="hint">librería</span>' : ""}

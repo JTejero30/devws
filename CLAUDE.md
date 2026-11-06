@@ -72,6 +72,13 @@ node/npm y uv en el PATH. Todo cambio va con su test.
 - `git fetch --prune` solo al hacer checkout o crear worktree.
 - Un trabajo (arrancar/preparar/instalar/parar) a la vez, salvo Parar: corta el
   trabajo en curso (mata fetch o instalador, deja de esperar puertos) y despues para.
+- Estado de un servicio: up, starting, down, crashed (lo arranco devws y su
+  proceso murio; se olvida al arrancar o parar su espacio), other_space (su
+  puerto lo tiene el servicio de otro espacio) o external (algo de fuera).
+- La UI solo reinicia/para/arranca servicios sueltos del espacio activo y nunca
+  con force (force en api_up para los servicios de otro espacio).
+- `/api/repos` dice donde esta abierta cada rama (`open`) y la rama real y los
+  cambios de cada worktree (`worktrees`): con eso la UI avisa antes de arrancar.
 
 ## Sin probar en macOS
 
@@ -84,12 +91,8 @@ node/npm y uv en el PATH. Todo cambio va con su test.
    tiene cambios sin commitear), para que no queden worktrees huerfanos; y
    renombrar el panel de "carpetas de worktree que no pertenecen a ningun
    espacio" a algo mas claro.
-2. En el formulario de espacio, avisar en linea cuando la rama elegida ya esta
-   abierta en otro sitio, sugiriendo dejar el repo fuera para que corra desde
-   el original.
-3. Seguridad: quitar credenciales (`user:token@` en URLs, patrones `glpat-…` y
+2. Seguridad: quitar credenciales (`user:token@` en URLs, patrones `glpat-…` y
    similares) de los errores de git y de los logs antes de que lleguen a la UI
-   o al MCP.
-4. Opcional: refrescar ramas al abrir el formulario de espacio (o boton
-   "Actualizar ramas"); opcion de rama derivada cuando una rama ya esta
-   abierta; clonar node_modules con APFS clone.
+   o al MCP. El sitio natural es git_msg() en server.py.
+3. Opcional: boton "Actualizar ramas" (git fetch) en el formulario de espacio
+   (al abrirlo ya se refresca lo local); clonar node_modules con APFS clone.
