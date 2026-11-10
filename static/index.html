@@ -166,6 +166,8 @@ white-space:pre-wrap; word-break:break-all; color:#c9d1d9; }
 .cl-why { color:var(--dim); flex:1 1 260px; min-width:0; }
 .cl-row.dim .cl-name { color:var(--dim); }
 #pfNudge { margin:-4px 0 10px; color:var(--yellow); }
+.env-origin { display:flex; align-items:center; gap:8px; font-size:12px; margin-left:auto; }
+.p-table .env-x { color:var(--dim); font-size:11px; }
 #pfNudge:empty { display:none; }
 </style>
 </head>
@@ -177,6 +179,28 @@ white-space:pre-wrap; word-break:break-all; color:#c9d1d9; }
 <span class="hint">un solo espacio arrancado a la vez · siempre los mismos puertos</span>
 </header>
 <main>
+<div class="card" id="envCard">
+<div class="card-head">
+<h2>Entornos fijos</h2>
+<button class="primary" onclick="openEnvForm(null)">+ Nuevo entorno</button>
+<span class="hint">Un entorno de referencia (p. ej. desa o inte) con lo último de origin, listo con un botón. No toca tus repos ni tus espacios.</span>
+<span class="env-origin" id="envOrigin"></span>
+</div>
+<div class="p-form" id="envForm" style="display:none">
+<h3 id="envFormTitle">Nuevo entorno</h3>
+<div class="row"><label for="envName">Nombre</label><input type="text" id="envName" placeholder="ej: desa"></div>
+<div class="row"><label for="envBranch">Rama</label><input type="text" id="envBranch" list="envBranchList" placeholder="ej: develop" oninput="envFormWarn()">
+<datalist id="envBranchList"></datalist>
+<span class="hint" style="width:100%;padding-left:210px">La de todos sus repos. Abajo puedes poner otra en un repo concreto.</span></div>
+<div id="envServices" style="margin-top:8px"></div>
+<div id="envRepos" style="margin-top:8px"></div>
+<div class="p-actions">
+<button class="primary" onclick="saveEnv()">Guardar</button>
+<button onclick="closeEnvForm()">Cancelar</button>
+</div>
+</div>
+<div class="profiles-grid" id="envList"></div>
+</div>
 <div class="card">
 <div class="card-head">
 <h2>Espacios de trabajo</h2>
@@ -323,6 +347,8 @@ clearTimeout(toast._t); toast._t = setTimeout(() => t.style.display = "none", er
 
 // ---------------------------------------------------------------- estado
 let repos = [], services = [], wtState = {}, jobs = {}, activeProfile = null;
+let envState = {};  // entorno -> {branch, repos: {repo: {branch, behind, missing, dirty}}, fetched_at}
+const isEnv = p => !!(p && p.env_branch);
 let profiles = {};  // nombre -> perfil (toml)
 // limpieza (/api/cleanup): por espacio, ultimo uso, veredicto y estado de sus ramas
 let cleanup = null, cleanupAt = 0, cleanupLoading = false, cleanupRetry = null;
@@ -409,7 +435,7 @@ const wasBusy = !!busyJob();
 try {
 const st = await api("/api/state");
 services = st.services; activeProfile = st.active_profile || null;
-wtState = st.worktrees || {}; jobs = st.jobs || {};
+wtState = st.worktrees || {}; jobs = st.jobs || {}; envState = st.environments || {};
 for (const [n, j] of Object.entries(jobs)) if (j.status === "running") jobSince[n] ||= Date.now();
 for (const n of Object.keys(jobSince)) if (!jobs[n] || jobs[n].status !== "running") delete jobSince[n];
 } catch (e) { setActive("err", "sin conexión con el server devws: " + e.message); return; }
@@ -575,6 +601,26 @@ return `<div class="p-table"><div class="th">Repo</div><div class="th">Dónde</d
 + (others.length ? `<div class="p-others hint">${wt ? "Fuera del espacio y sin servicios aquí" : "No se tocan"}: ${others.map(x => `${esc(x.name)} <code>${esc(x.current || "sin rama")}</code>`).join(" · ")}</div>` : "");
 }
 
+// zona de estado de una tarjeta: lo que esta haciendo, o como acabo lo ultimo (con su hora)
+function jobLines(p, running) {
+const nm = esc(p.name), job = jobs[p.name], psv = profSvcs(p), lines = [];
+const act = `<a href="#" data-k="act" onclick="openLogs('${nm}','actividad');return false">ver actividad</a>`;
+const when = job && job.finished ? ` (${esc(job.finished)})` : "";
+if (job && job.status === "running") lines.push(["busy", `${esc(job.step || "trabajando…")}${elapsed(p.name)} ${act}`]);
+else if (job && job.status === "cancelled") lines.push(["warn", `${({ prepare: "Preparación cortada", install: "Instalación cortada" })[job.action] || "Arranque cortado"} al pulsar Parar${when}. ${act}`]);
+else if (job && job.status === "error" && !dismissed.has(dismissKey(p.name, job))) {
+// un error de arranque ya resuelto (todo arriba) no se sigue enseñando
+const allUp = psv.length && psv.every(n => svcView(p, n).st === "up");
+if (!(job.action === "start" && allUp)) {
+const what = running && job.action === "start" ? "Arrancado con problemas"
+: ({ stop: "Error al parar", prepare: "Error al preparar", install: "Error al instalar dependencias" })[job.action] || "Error al arrancar";
+lines.push([running ? "warn" : "err", `${what}${when}: ${esc(job.error)} ${act}`
++ ` <button class="link x" data-k="dismiss" onclick="dismissJob('${nm}')" title="ocultar este aviso" aria-label="ocultar este aviso">×</button>`]);
+}
+}
+return lines;
+}
+
 function profileCard(p) {
 const wt = p.worktree === true;
 const job = jobs[p.name];
@@ -590,22 +636,7 @@ const mode = wt
 ? `<b>Worktrees</b> en worktrees/${nm}__&lt;repo&gt; · los repos de fuera corren desde su carpeta original`
 : `<b>Repos originales</b> · al arrancar hace checkout de estas ramas en tus carpetas`;
 
-// zona de estado: lo que esta haciendo, o como acabo lo ultimo (con su hora)
-const lines = [];
-const act = `<a href="#" data-k="act" onclick="openLogs('${nm}','actividad');return false">ver actividad</a>`;
-const when = job && job.finished ? ` (${esc(job.finished)})` : "";
-if (working) lines.push(["busy", `${esc(job.step || "trabajando…")}${elapsed(p.name)} ${act}`]);
-else if (job && job.status === "cancelled") lines.push(["warn", `${({ prepare: "Preparación cortada", install: "Instalación cortada" })[job.action] || "Arranque cortado"} al pulsar Parar${when}. ${act}`]);
-else if (job && job.status === "error" && !dismissed.has(dismissKey(p.name, job))) {
-// un error de arranque ya resuelto (todo arriba) no se sigue enseñando
-const allUp = psv.length && psv.every(n => svcView(p, n).st === "up");
-if (!(job.action === "start" && allUp)) {
-const what = running && job.action === "start" ? "Arrancado con problemas"
-: ({ stop: "Error al parar", prepare: "Error al preparar", install: "Error al instalar dependencias" })[job.action] || "Error al arrancar";
-lines.push([running ? "warn" : "err", `${what}${when}: ${esc(job.error)} ${act}`
-+ ` <button class="link x" data-k="dismiss" onclick="dismissJob('${nm}')" title="ocultar este aviso" aria-label="ocultar este aviso">×</button>`]);
-}
-}
+const lines = jobLines(p, running);
 const problems = running && (lines.some(([c]) => c !== "busy") || psv.some(n => ["down", "crashed"].includes(svcView(p, n).st)));
 // limpieza: si sobra o hay que revisarlo, y cuanto lleva sin tocarse
 const cl = spaceClean(p.name), quiet = cl && !running && !working;
@@ -653,15 +684,16 @@ ${del}`,
 // una caja por espacio, en tres zonas (contenido, estado, botones): solo se
 // repinta la que cambia; asi el paso de un trabajo no rehace el boton Parar
 function renderProfiles() {
+renderEnvs();
 const host = $("#profilesList"), a = document.activeElement;
 // no repintar mientras se elige en un desplegable de una tarjeta
 if (a && a.tagName === "SELECT" && host.contains(a)) return;
 // del usado hace menos al mas olvidado (sin datos de limpieza aun: por nombre)
 const used = p => (spaceClean(p.name) || {}).last_used || 0;
-const list = Object.values(profiles).sort((a, b) => used(b) - used(a) || a.name.localeCompare(b.name));
+const list = Object.values(profiles).filter(p => !isEnv(p)).sort((a, b) => used(b) - used(a) || a.name.localeCompare(b.name));
 if (!list.length) return paint(host, '<div class="empty">Todavía no hay espacios. Crea uno con <b>+ Nuevo</b>.</div>');
 host._html = null;
-for (const el of [...host.children]) if (!el.dataset.p || !profiles[el.dataset.p]) el.remove();
+for (const el of [...host.children]) if (!el.dataset.p || !profiles[el.dataset.p] || isEnv(profiles[el.dataset.p])) el.remove();
 list.forEach((p, i) => {
 let el = [...host.children].find(x => x.dataset.p === p.name);
 if (!el) {
@@ -673,6 +705,149 @@ const c = profileCard(p), card = el.firstElementChild;
 card.className = `p-card ${c.cls}`;
 paint(card.children[0], c.main); paint(card.children[1], c.status); paint(card.children[2], c.actions);
 });
+}
+
+// ---------------------------------------------------------------- entornos fijos
+// Un entorno es un perfil con env_branch: worktrees en solo lectura de lo ultimo
+// de origin/<rama> (una rama para todos sus repos, con excepciones). Por repo se
+// dice si esta al dia con lo que se sabe de origin o cuantos commits le faltan.
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+function envOriginHtml(p, r, running) {
+const e = ((envState[p.name] || {}).repos || {})[r];
+if (!e) return '<span class="hint">…</span>';
+if (e.error) return `<span class="err-t" title="${esc(e.error)}">error</span>`;
+if (e.missing) return `<span class="err-t">${esc(e.branch)} no está en origin</span>`;
+if (e.behind === null) return '<span class="hint">se crea al levantar</span>';
+const dirty = e.dirty ? ` <span class="warn-t" title="worktrees/${esc(p.name)}__${esc(r)}: con cambios no se actualiza">· ${plural(e.dirty, "fichero cambiado", "ficheros cambiados")}</span>` : "";
+if (!e.behind) return `<span class="ok-t">al día</span>${dirty}`;
+return `<span class="warn-t">${plural(e.behind, "commit nuevo", "commits nuevos")} en origin</span>`
++ ` <span class="hint">· ${running ? "se aplican al actualizar" : "se aplican al levantar"}</span>${dirty}`;
+}
+function envCard(p) {
+const nm = esc(p.name), job = jobs[p.name], working = job && job.status === "running";
+const running = isRunning(p), active = isActive(p), busy = busyJob(), psv = profSvcs(p);
+const st = envState[p.name] || {}, er = st.repos || {};
+const behind = Object.values(er).some(e => e.behind > 0);
+const order = [];
+for (const n of psv) { const r = svcDef(n).repo; if (r && !order.includes(r)) order.push(r); }
+for (const r of Object.keys(p.repos || {})) if (!order.includes(r)) order.push(r);
+const rows = order.map(r => {
+const b = (p.repos || {})[r] || p.env_branch;
+const svcs = psv.filter(n => svcDef(n).repo === r);
+return `<div class="td repo">${esc(r)}</div><div class="td"><code>${esc(b)}</code>${b !== p.env_branch ? ' <span class="env-x">(excepción)</span>' : ""}</div>`
++ `<div class="td">${envOriginHtml(p, r, running)}</div>`
++ `<div class="td">${svcs.length ? svcs.map(n => svcHtml(p, n, active, working)).join("") : '<span class="hint">sin servicio</span>'}</div>`;
+}).join("");
+const lines = jobLines(p, running);
+const problems = running && (lines.some(([c]) => c !== "busy") || psv.some(n => ["down", "crashed"].includes(svcView(p, n).st)));
+const wait = "Espera a que termine lo que está haciendo";
+const primary = working && job.action === "stop" ? `<button class="stop" data-k="primary" disabled>Parando…</button>`
+: running || working ? `<button class="stop" data-k="primary" onclick="stopProfile('${nm}')">Parar</button>`
+: busy ? offBtn("primary", "Levantar", "primary", busyWhy(busy))
+: `<button class="primary" data-k="primary" onclick="startProfile('${nm}')" title="trae lo último de origin/${esc(p.env_branch)} y arranca sus servicios">Levantar</button>`;
+const update = running && !working && behind
+? (busy ? offBtn("", "Actualizar", "upd", busyWhy(busy))
+: `<button data-k="upd" onclick="updateEnv('${nm}')" title="lo para, trae lo último de origin y lo vuelve a levantar">Actualizar</button>`) : "";
+const edit = working ? offBtn("link", "editar", "edit", wait) : `<button class="link" data-k="edit" onclick="openEnvForm('${nm}')">editar</button>`;
+const del = working ? offBtn("link danger", "eliminar", "del", wait)
+: running ? offBtn("link danger", "eliminar", "del", "Para el entorno antes de eliminarlo")
+: `<button class="link danger" data-k="del" onclick="deleteEnv('${nm}')">eliminar</button>`;
+const code = wtState[p.name] ? `<button class="link" data-k="vscode" onclick="wtOpen('${nm}')" title="abre en VS Code sus carpetas (solo lectura: no hagas commits ahí)">VS Code</button>` : "";
+return `<div class="p-card ${working ? "busy" : problems ? "warnb" : running ? "running" : ""}">
+<h3>${nm} <code style="font-size:12px;font-weight:400">${esc(p.env_branch)}</code>${running && !working ? ` <span class="badge ${problems ? "warn" : "up"}">arrancado</span>` : ""}${working ? ' <span class="badge starting">trabajando</span>' : ""}</h3>
+<div class="mode">Lo último de origin en <b>solo lectura</b> · worktrees/${nm}__&lt;repo&gt;</div>
+<div class="p-table"><div class="th">Repo</div><div class="th">Rama</div><div class="th">Origin</div><div class="th">Servicios</div>${rows}</div>
+${lines.map(([c, h]) => `<div class="status-line ${c}">${h}</div>`).join("")}
+<div class="p-actions">${primary}${update}
+<button class="link" data-k="logs" onclick="openLogs('${nm}')">logs</button>${edit}${code}<span style="flex:1"></span>${del}</div>
+</div>`;
+}
+function renderEnvs() {
+const host = $("#envList"), list = Object.values(profiles).filter(isEnv).sort((a, b) => a.name.localeCompare(b.name));
+if (!list.length) paint(host, '<div class="empty">Sin entornos. Crea uno (p. ej. <b>desa</b> en develop) con <b>+ Nuevo entorno</b>.</div>');
+else {
+// una caja por entorno, repintada solo si cambia (el foco se queda en su tarjeta)
+host._html = null;
+for (const el of [...host.children]) if (!el.dataset.env || !list.some(p => p.name === el.dataset.env)) el.remove();
+list.forEach((p, i) => {
+let el = [...host.children].find(x => x.dataset.env === p.name);
+if (!el) { el = document.createElement("div"); el.dataset.env = p.name; }
+if (host.children[i] !== el) host.insertBefore(el, host.children[i] || null);
+paint(el, envCard(p));
+});
+}
+// lo que se sabe de origin: de la ultima vez que se trajo (al levantar o al comprobar)
+const ats = list.map(p => (envState[p.name] || {}).fetched_at).filter(x => x !== undefined);
+const at = ats.length && !ats.includes(null) ? Math.min(...ats) : null;
+const busy = busyJob(), fj = jobs[FETCH_JOB], fetching = fj && fj.status === "running";
+const btn = !list.length || fetching ? "" : busy ? offBtn("link", "Comprobar con origin", "env-fetch", busyWhy(busy))
+: `<button class="link" data-k="env-fetch" onclick="cleanupFetch()" title="git fetch de todos los repos: así se sabe si los entornos tienen commits nuevos">Comprobar con origin</button>`;
+paint($("#envOrigin"), !list.length ? "" : (fetching ? `<span class="warn-t">${esc(fj.step || "comprobando con origin…")}</span>`
+: `<span class="hint">${at ? `origin consultado ${ago(at)}` : "origin sin consultar"}</span>`) + btn);
+}
+async function updateEnv(name) {
+if (!confirm(`¿Actualizar ${name}?\n\nSe paran sus servicios, se trae lo último de origin y se vuelven a levantar.`)) return;
+startProfile(name);
+}
+const deleteEnv = name => removeFlow({ spaces: [name] }, `el entorno "${name}"`);
+
+// formulario de entorno: nombre, rama, servicios y excepciones de rama por repo
+let editingEnv = null, envSvcSel = new Set(), envOverrides = {};
+function openEnvForm(name) {
+editingEnv = name || null;
+const p = name ? profiles[name] : null;
+$("#envForm").style.display = "block";
+$("#envFormTitle").textContent = name ? `Editando el entorno ${name}` : "Nuevo entorno";
+$("#envName").value = name || ""; $("#envName").disabled = !!name;
+$("#envBranch").value = p ? p.env_branch : "";
+envSvcSel = new Set(p ? profSvcs(p) : allServiceNames());
+envOverrides = p ? Object.fromEntries(Object.entries(p.repos || {}).filter(([, b]) => b !== p.env_branch)) : {};
+renderEnvForm();
+$("#envForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
+if (!name) $("#envName").focus();
+refreshRepos().then(renderEnvForm);
+}
+function closeEnvForm() { $("#envForm").style.display = "none"; editingEnv = null; }
+const envFormRepos = () => [...new Set(allServiceNames().filter(n => envSvcSel.has(n)).map(n => svcDef(n).repo).filter(Boolean))];
+function renderEnvForm() {
+const all = [...new Set(repos.flatMap(r => r.branches || []))].sort();
+$("#envBranchList").innerHTML = all.map(b => `<option value="${esc(b)}">`).join("");
+$("#envServices").innerHTML = "<div class='sect'>Servicios</div><div class='hint' style='margin-bottom:4px'>Los que levanta el entorno, cada uno desde su worktree.</div>"
++ allServiceNames().map(n => `<label class="opt"><input type="checkbox" data-envsvc="${esc(n)}" ${envSvcSel.has(n) ? "checked" : ""} onchange="envSvcToggle(this)">`
++ `<span>${esc(n)} <span class="hint">:${svcDef(n).port || "?"} · ${esc(svcDef(n).repo || "")}</span></span></label>`).join("");
+const rs = envFormRepos();
+$("#envRepos").innerHTML = !rs.length ? "" : "<div class='sect'>Rama por repo</div>" + rs.map(r => `<div class="row">
+<label for="envr-${esc(r)}">${esc(r)}</label>
+<select id="envr-${esc(r)}" data-envrepo="${esc(r)}" onchange="envOverrides['${esc(r)}']=this.value;envFormWarn()">
+<option value="">la del entorno</option>
+${(repoOf(r).branches || []).map(b => `<option value="${esc(b)}" ${envOverrides[r] === b ? "selected" : ""}>${esc(b)}</option>`).join("")}
+</select><div class="pf-warn" role="status"></div></div>`).join("");
+envFormWarn();
+}
+function envSvcToggle(cb) { cb.checked ? envSvcSel.add(cb.dataset.envsvc) : envSvcSel.delete(cb.dataset.envsvc); renderEnvForm(); }
+// avisa de las ramas que no existen en un repo (levantarlo fallaria: no se crean)
+function envFormWarn() {
+const b = $("#envBranch").value.trim();
+document.querySelectorAll("#envRepos [data-envrepo]").forEach(sel => {
+const r = sel.dataset.envrepo, want = sel.value || b, ri = repoOf(r);
+sel.options[0].textContent = b ? `la del entorno (${b})` : "la del entorno";
+const box = sel.closest(".row").querySelector(".pf-warn");
+box.textContent = want && ri.branches && !ri.branches.includes(want) ? `⚠ ${r} no tiene la rama ${want}: el entorno no se podrá levantar.` : "";
+});
+}
+async function saveEnv() {
+const name = $("#envName").value.trim() || editingEnv || "", env_branch = $("#envBranch").value.trim();
+if (!name) return toast("ponle un nombre al entorno", true);
+if (!env_branch) return toast("elige la rama del entorno", true);
+const services = allServiceNames().filter(n => envSvcSel.has(n));
+if (!services.length) return toast("elige al menos un servicio", true);
+const rs = envFormRepos(), repos = Object.fromEntries(Object.entries(envOverrides).filter(([r, b]) => b && rs.includes(r)));
+try {
+await api("/api/profiles", { method: editingEnv ? "PUT" : "POST", headers: { "Content-Type": "application/json" },
+body: JSON.stringify({ name, env_branch, services, repos, worktree: true }) });
+toast(`entorno "${name}" ${editingEnv ? "actualizado" : "creado"}: pulsa Levantar para usarlo`);
+closeEnvForm(); await loadProfiles(); refresh();
+} catch (e) { toast(e.message, true); }
 }
 
 // ---------------------------------------------------------------- acciones
