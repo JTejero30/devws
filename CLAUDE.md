@@ -67,6 +67,16 @@ node/npm y uv en el PATH. Todo cambio va con su test.
   "solo lectura" (`readonly = [...]` en el perfil): worktree con HEAD detached
   en lo ultimo de origin/<rama>, asi varios espacios comparten la rama. Se
   actualiza al preparar/arrancar salvo que tenga cambios o commits propios.
+- Entornos fijos (seccion aparte en la UI): un perfil con `env_branch` (p. ej.
+  desa = develop). Siempre worktree y todos sus repos en solo lectura: los de sus
+  servicios (elegibles; por defecto todos), cada uno en `env_branch` salvo
+  excepcion en `[repos]`. Se levantan como un espacio (mismo trabajo, mismos
+  puertos, solo uno activo). `/api/state` da `environments`: por repo, commits de
+  origin que le faltan (`behind`, con lo ya traido; sin fetch), rama que no esta
+  en origin (`missing`) y ficheros cambiados. "Actualizar" = volver a levantar.
+  No salen en Limpieza (nunca sobran) y un espacio no se convierte en entorno ni
+  al reves. MCP: `environments` en devws_status, devws_start_environment y
+  devws_stop_environment.
 - Dependencias de un worktree: solo al arrancarlo o con "instalar", y solo si
   cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`).
 - `git fetch --prune` solo al hacer checkout, crear worktree, "Comprobar con

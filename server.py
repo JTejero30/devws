@@ -280,6 +280,9 @@ class ProfileIn(BaseModel):
     # repos en solo lectura: worktree detached en lo ultimo de origin/<rama>
     # (varios espacios pueden seguir la misma rama a la vez); solo con worktree
     readonly: list[str] = []
+    # entorno fijo (p. ej. desa, inte): rama de todos sus repos (en `repos`, las
+    # excepciones). Siempre worktree y en solo lectura; ver check_profile
+    env_branch: str | None = None
 
 
 def repo_status(name: str) -> dict:
@@ -999,6 +1002,13 @@ def readonly_ref(p: Path, name: str, branch: str) -> str:
     raise HTTPException(400, f"{name}: no existe la rama {branch} (en solo lectura no se crean ramas)")
 
 
+def head_in_branches(d: Path) -> bool:
+    """El HEAD (detached) esta en alguna rama local o de origin: moverlo, aunque
+    sea a otra rama (p. ej. al cambiar la de un entorno), no pierde commits."""
+    return bool(git(d, "for-each-ref", "--contains", "HEAD", "--count=1", "--format=%(refname)",
+                    "refs/heads", "refs/remotes").strip())
+
+
 def wt_ensure_readonly(name: str, branch: str, profile: str) -> str | None:
     """Deja el worktree del repo para el perfil en HEAD detached en lo ultimo de
     `branch` (lo crea si no existe). Git impide tener la misma rama abierta en
@@ -1016,8 +1026,8 @@ def wt_ensure_readonly(name: str, branch: str, profile: str) -> str | None:
             pass
         elif git(d, "status", "--porcelain").strip():
             return f"{name}: worktree con cambios locales; no se actualiza a {branch}"
-        elif not on_branch and not is_ancestor(d, head, target):
-            return f"{name}: el worktree tiene commits que no estan en {branch}; no se actualiza"
+        elif not on_branch and not head_in_branches(d):
+            return f"{name}: el worktree tiene commits que no estan en ninguna rama; no se actualiza a {branch}"
         else:
             git(d, "checkout", "-q", "--detach", target)
     else:
@@ -1314,6 +1324,43 @@ def service_ids(state: dict, wts: dict) -> list[str]:
     return ids
 
 
+def env_profiles() -> dict[str, dict]:
+    """Entornos fijos: perfiles con env_branch."""
+    out = {}
+    for name in api_profiles_list():
+        try:
+            prof = load_profile(name) or {}
+        except tomllib.TOMLDecodeError:
+            continue
+        if prof.get("env_branch"):
+            out[name] = prof
+    return out
+
+
+def env_status(name: str, prof: dict) -> dict:
+    """Como esta cada repo de un entorno respecto a origin/<rama>, con lo que se
+    sabe de origin (sin fetch: eso se hace al levantarlo o con "Comprobar con
+    origin"). Por repo: behind = commits de origin que el worktree aun no tiene
+    (None si el worktree aun no existe), missing = la rama no esta en origin."""
+    out, fetched = {}, []
+    for r, b in prof.get("repos", {}).items():
+        e = {"branch": b, "behind": None, "missing": False}
+        try:
+            p = repo_path(r)
+            fetched.append(fetched_at(p) or 0)
+            ref, d = f"refs/remotes/origin/{b}", wt_dir_for(name, r)
+            if not _ref_exists(p, ref):
+                e["missing"] = True
+            elif d.is_dir():
+                e["behind"] = rev_count(d, f"HEAD..{ref}")
+                e["dirty"] = wt_dirty(d)
+        except (RuntimeError, HTTPException) as ex:
+            e["error"] = str(ex.detail if isinstance(ex, HTTPException) else ex)
+        out[r] = e
+    return {"branch": prof.get("env_branch"), "repos": out,
+            "fetched_at": (min(fetched) or None) if fetched else None}
+
+
 @app.get("/api/state")
 def api_state():
     state = load_state()
@@ -1325,6 +1372,7 @@ def api_state():
                          for i in service_ids(state, wts)],
             "active_profile": state.get("active_profile"),
             "worktrees": wts,
+            "environments": {n: env_status(n, p) for n, p in env_profiles().items()},
             "jobs": state.get("jobs", {})}
 
 
@@ -1433,6 +1481,8 @@ def profile_body(req: ProfileIn, created_at: str | None = None) -> str:
         f'created_at = {toml_str(created_at or time.strftime("%Y-%m-%d %H:%M"))}',
         f'worktree = {"true" if req.worktree else "false"}',
     ]
+    if req.env_branch:
+        body.append(f'env_branch = {toml_str(req.env_branch)}')
     readonly = [r for r in req.readonly if r in req.repos]
     if readonly:
         body.append("readonly = [" + ", ".join(toml_str(r) for r in readonly) + "]")
@@ -1448,13 +1498,50 @@ def profile_body(req: ProfileIn, created_at: str | None = None) -> str:
 def profile_in(name: str, prof: dict) -> ProfileIn:
     return ProfileIn(name=name, repos=prof.get("repos", {}), worktree=bool(prof.get("worktree")),
                      services=prof.get("services", {}).get("services", []),
-                     bases=prof.get("bases", {}), readonly=prof.get("readonly", []))
+                     bases=prof.get("bases", {}), readonly=prof.get("readonly", []),
+                     env_branch=prof.get("env_branch"))
+
+
+BRANCH_RE = r"[A-Za-z0-9._/-]+"
+
+
+def check_branch(b: str) -> str:
+    b = (b or "").strip()
+    if not re.fullmatch(BRANCH_RE, b) or ".." in b or b.startswith(("-", "/")) or b.endswith((".", "/")):
+        raise HTTPException(400, f"rama invalida: {b!r}")
+    return b
 
 
 def check_profile(req: ProfileIn) -> None:
     check_name(req.name, "perfil")
+    if req.env_branch is not None:
+        normalize_env(req)
     if req.readonly and not req.worktree:
         raise HTTPException(400, "solo lectura solo se puede usar en espacios worktree")
+
+
+def normalize_env(req: ProfileIn) -> None:
+    """Un entorno fijo: worktrees en solo lectura (HEAD detached en lo ultimo de
+    origin/<rama>) de los repos de sus servicios (por defecto, todos) mas los
+    repos que se le pongan aparte, cada uno en la rama del entorno salvo
+    excepcion. No crea ramas ni toca las carpetas originales."""
+    branch = check_branch(req.env_branch)
+    known = [s["name"] for s in services()]
+    unknown = [s for s in req.services if s not in known]
+    if unknown:
+        raise HTTPException(400, f"servicio desconocido: {', '.join(unknown)}")
+    svcs = list(dict.fromkeys(req.services)) or known  # en el orden pedido: el de arranque
+    out = {}
+    for s in svcs:
+        r = service(s)["repo"]
+        out[r] = req.repos.get(r) or branch
+    for r, b in req.repos.items():
+        out.setdefault(r, b or branch)
+    for r in out:
+        repo_path(r)
+        out[r] = check_branch(out[r])
+    req.env_branch, req.repos, req.worktree = branch, out, True
+    req.readonly, req.bases, req.services = list(out), {}, svcs
 
 
 @app.post("/api/profiles")
@@ -1475,6 +1562,9 @@ def api_profiles_update(req: ProfileIn):
     old = load_profile(req.name)
     if old is None:
         raise HTTPException(404, f"perfil no existe: {req.name}")
+    if bool(old.get("env_branch")) != bool(req.env_branch):
+        raise HTTPException(409, f"{req.name} es un {'entorno' if old.get('env_branch') else 'espacio'}"
+                                 f", no un {'espacio' if old.get('env_branch') else 'entorno'}")
     profile_file(req.name).write_text(profile_body(req, old.get("created_at")))
     note_used(req.name)
     return {"ok": True}
@@ -1942,6 +2032,8 @@ def api_wt_adopt(dir: str):
     old = load_profile(prof)
     if old is not None and not old.get("worktree"):
         raise HTTPException(409, f"ya existe un perfil in-place llamado {prof}")
+    if old is not None and old.get("env_branch"):
+        raise HTTPException(409, f"{prof} es un entorno: edítalo para añadirle el repo")
     if old is None:
         # sin lista de servicios = todos (los de otros repos corren desde el original)
         req = ProfileIn(name=prof, repos={rname: branch}, worktree=True)
@@ -2321,6 +2413,8 @@ def cleanup_report() -> dict:
     spaces, orphans, sized = {}, [], []
     for name in api_profiles_list():
         prof = load_profile(name) or {}
+        if prof.get("env_branch"):
+            continue  # los entornos fijos no sobran nunca: se eliminan a mano
         is_wt = bool(prof.get("worktree"))
         rows, times = [], [state.get("used", {}).get(name, 0.0)]
         try:
@@ -2634,6 +2728,12 @@ Reglas:
   borrarlos (con sus ramas) y espera su confirmacion. De los de revisar, dile
   como estan; no los borres.
 - Commits y push los hace el agente con git dentro de cada worktree, como siempre.
+- Entornos fijos (environments en devws_status): p. ej. desa o inte, todos sus
+  repos en lo ultimo de origin/<rama> en solo lectura (worktrees/{entorno}__{repo}).
+  Sirven para levantar un entorno de referencia con devws_start_environment (o
+  pararlo con devws_stop_environment); no se desarrolla en ellos ni se hacen
+  commits. Por repo, behind = commits de origin que aun no tiene (se ponen al
+  dia al levantarlo). Los crea y edita el usuario desde la UI.
 - Estado de un servicio: up, starting, down, crashed (devws lo arranco y su
   proceso murio: mira su log), other_space (su puerto lo usa el servicio de otro
   espacio, en owner) o external (lo usa algo que no es de devws).
@@ -2705,6 +2805,20 @@ def space_info(name: str) -> dict:
     }
 
 
+def env_info(name: str, prof: dict) -> dict:
+    st = env_status(name, prof)
+    info = space_info(name)
+    return {"name": name, "branch": st["branch"], "active": info["active"], "dirs": info["dirs"],
+            "repos": st["repos"], "fetched_at": st["fetched_at"], "services": info["services"]}
+
+
+def env_or_error(name: str) -> dict:
+    prof = load_profile(name)
+    if prof is None or not prof.get("env_branch"):
+        raise ToolError(f"no existe el entorno {name}; los entornos estan en devws_status (environments)")
+    return prof
+
+
 @mcp.tool()
 def devws_status() -> dict:
     """Estado del workspace: repos (ruta, rama actual, cambios sin commitear),
@@ -2713,6 +2827,7 @@ def devws_status() -> dict:
     dias sin uso y por que)."""
     state = load_state()
     clean = cleanup_report()["spaces"]
+    envs = env_profiles()
     return {
         "workspace_root": str(WORKSPACE_ROOT),
         "repos": [{"name": r["name"], "path": str(repo_path(r["name"])), "kind": r.get("kind"),
@@ -2725,6 +2840,7 @@ def devws_status() -> dict:
         "active_profile": state.get("active_profile"),
         "spaces": [{**space_info(n), "cleanup": {k: clean[n][k] for k in ("verdict", "idle_days", "reasons")}}
                    for n in api_profiles_list() if n in clean],
+        "environments": [env_info(n, p) for n, p in envs.items()],
         "jobs": {p: j for p, j in state.get("jobs", {}).items() if j.get("status") == "running"},
     }
 
@@ -2752,6 +2868,8 @@ def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, st
     old = load_profile(name)
     if old is not None and not old.get("worktree"):
         raise ToolError(f"{name} es un perfil in-place; usa otro nombre")
+    if old is not None and old.get("env_branch"):
+        raise ToolError(f"{name} es un entorno fijo; usa otro nombre")
     for r in repos:
         tool_call(repo_path, r)
     if old is None:
@@ -2794,6 +2912,25 @@ def devws_stop(name: str) -> dict:
     """Para los servicios de un espacio."""
     tool_call(api_profile_stop, name)
     return {**wait_job_done(name), **space_info(name)}
+
+
+@mcp.tool()
+def devws_start_environment(name: str, force: bool = False) -> dict:
+    """Levanta un entorno fijo (p. ej. desa): pone cada repo en lo ultimo de
+    origin/<rama> (git fetch), instala lo que haya cambiado y arranca sus
+    servicios. Si hay otro espacio o entorno arrancado falla salvo force=true,
+    que lo para antes: pide confirmacion al usuario."""
+    prof = env_or_error(name)
+    tool_call(api_profile_start, name, force=force)
+    return {**wait_job_done(name), **env_info(name, prof)}
+
+
+@mcp.tool()
+def devws_stop_environment(name: str) -> dict:
+    """Para los servicios de un entorno fijo."""
+    prof = env_or_error(name)
+    tool_call(api_profile_stop, name)
+    return {**wait_job_done(name), **env_info(name, prof)}
 
 
 @mcp.tool()

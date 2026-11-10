@@ -1352,3 +1352,91 @@ def test_solo_lectura_misma_rama_en_varios_espacios(ws):
     assert git_out(Path(w["dirs"]["worker"]), "rev-parse", "HEAD") == v2
     err, r = mcp_tool(c, "devws_remove_workspace", name="romcp")
     assert not err and r["ok"], r
+
+
+def test_entornos_fijos(ws):
+    """Un entorno fijo (p. ej. inte) levanta sus servicios desde worktrees en lo
+    ultimo de origin/<rama> (con excepciones por repo) y dice por repo si esta al
+    dia con origin o cuantos commits nuevos tiene."""
+    c, dws, root, ports = ws["c"], ws["dws"], ws["root"], ws["ports"]
+    clone = root / "_clone_inte"
+    sh(root, "git", "clone", "-q", str(root / "_remotes" / "commons_worker.git"), str(clone))
+    sh(clone, "git", "config", "user.email", "test@devws")
+    sh(clone, "git", "config", "user.name", "test")
+    sh(clone, "git", "checkout", "-q", "-b", "inte")
+
+    def push_inte(msg: str) -> str:
+        (clone / "INTE").write_text(msg)
+        sh(clone, "git", "add", ".")
+        sh(clone, "git", "commit", "-q", "-m", msg)
+        sh(clone, "git", "push", "-q", "origin", "HEAD:inte")
+        return git_out(clone, "rev-parse", "HEAD")
+
+    v1 = push_inte("v1")
+    for bad, why in (({"env_branch": " "}, "rama invalida"), ({"env_branch": "inte", "services": ["nope"]},
+                                                              "servicio desconocido")):
+        status, out = c.post("/api/profiles", {"name": "inte", "repos": {}, **bad}, ok=False)
+        assert status == 400 and why in out["detail"], out
+
+    # rama del entorno para todos sus repos; api con una excepcion
+    c.post("/api/profiles", {"name": "inte", "env_branch": "inte", "services": ["worker", "api"],
+                             "repos": {"api": "feat-a"}})
+    p = c.get("/api/profiles/inte")
+    assert p["worktree"] and p["env_branch"] == "inte", p
+    assert p["repos"] == {"worker": "inte", "api": "feat-a"} and p["readonly"] == ["worker", "api"], p
+    assert p["services"]["services"] == ["worker", "api"]
+    env = c.get("/api/state")["environments"]["inte"]
+    assert env["branch"] == "inte" and env["repos"]["worker"]["behind"] is None, "sin worktree aun"
+    assert "inte" not in c.get("/api/cleanup")["spaces"], "un entorno no sobra nunca"
+    status, out = c.put("/api/profiles", {"name": "inte", "repos": {"worker": "inte"}, "worktree": True}, ok=False)
+    assert status == 409 and "es un entorno" in out["detail"], "no se convierte en espacio"
+    err, msg = mcp_tool(c, "devws_create_workspace", name="inte", repos={"worker": "inte"})
+    assert err and "entorno" in msg
+
+    # levantar: worktrees detached en lo ultimo de origin y servicios desde ellos
+    c.post("/api/profiles/inte/start?force=true")
+    wait_job(c, "inte")
+    wt_worker, wt_api = dws / "worktrees" / "inte__worker", dws / "worktrees" / "inte__api"
+    assert git_out(wt_worker, "branch", "--show-current") == "" and git_out(wt_worker, "rev-parse", "HEAD") == v1
+    assert (wt_api / "BRANCH").read_text() == "feat-a"
+    assert fetch(ports["worker"]) == str(wt_worker) and fetch(ports["api"]) == str(wt_api)
+    env = c.get("/api/state")["environments"]["inte"]
+    assert {r: (e["behind"], e["missing"]) for r, e in env["repos"].items()} == {"worker": (0, False), "api": (0, False)}
+    assert env["fetched_at"], "origin se consulto al levantarlo"
+
+    # origin avanza: tras comprobar con origin se ve el commit nuevo; levantar de nuevo lo trae
+    v2 = push_inte("v2")
+    c.post("/api/cleanup/fetch")
+    wait_job(c, "__origin")
+    assert c.get("/api/state")["environments"]["inte"]["repos"]["worker"]["behind"] == 1
+    err, st = mcp_tool(c, "devws_status")
+    e = next(x for x in st["environments"] if x["name"] == "inte")
+    assert e["branch"] == "inte" and e["active"] and e["repos"]["worker"]["behind"] == 1, e
+    assert "inte" not in [s["name"] for s in st["spaces"]]
+    err, w = mcp_tool(c, "devws_start_environment", name="inte")
+    assert not err and w["status"] == "ok" and w["repos"]["worker"]["behind"] == 0, w
+    assert git_out(wt_worker, "rev-parse", "HEAD") == v2
+    assert all(s["status"] == "up" for s in w["services"]), w
+
+    # cambiar la rama del entorno: el worktree pasa a la nueva (no se pierde nada)
+    c.put("/api/profiles", {"name": "inte", "env_branch": "feat-a", "repos": {}, "services": ["worker", "api"]})
+    assert c.get("/api/profiles/inte")["repos"] == {"worker": "feat-a", "api": "feat-a"}
+    err, w = mcp_tool(c, "devws_start_environment", name="inte")
+    assert not err and w["status"] == "ok", w
+    assert (wt_worker / "BRANCH").read_text() == "feat-a"
+    c.put("/api/profiles", {"name": "inte", "env_branch": "no-existe", "repos": {}, "services": ["worker"]})
+    env = c.get("/api/state")["environments"]["inte"]
+    assert env["repos"] == {"worker": {"branch": "no-existe", "behind": None, "missing": True}}, env
+
+    err, w = mcp_tool(c, "devws_stop_environment", name="inte")
+    assert not err and not w["active"] and w["services"][0]["status"] == "down", w
+    err, msg = mcp_tool(c, "devws_start_environment", name="nope")
+    assert err and "no existe el entorno" in msg
+
+    # eliminarlo borra sus carpetas; ninguna rama
+    plan = c.post("/api/cleanup/plan", {"spaces": ["inte"]})
+    assert plan["targets"][0]["branches"] == [], plan
+    r = c.post("/api/cleanup/remove", {"spaces": ["inte"]})
+    assert r["ok"] and r["deleted"] == [], r
+    assert not wt_worker.exists() and not wt_api.exists() and "inte" not in c.get("/api/profiles")
+    assert git_out(root / "commons" / "worker", "ls-remote", "--heads", "origin", "inte") != ""

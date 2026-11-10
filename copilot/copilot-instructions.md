@@ -16,3 +16,6 @@ Este workspace tiene varios repos gestionados por devws (herramientas MCP `devws
 - Un cambio pequeno en un solo repo y en su rama actual se hace en el sitio, sin worktree.
 - `devws_start` con `force` (para otro espacio arrancado) y `devws_remove_workspace` solo con
   confirmacion explicita del usuario.
+- Para probar contra un entorno de referencia (p. ej. desa o inte) usa los entornos fijos
+  (`environments` en `devws_status`): `devws_start_environment` / `devws_stop_environment`.
+  Son solo lectura: no edites ni hagas commits en sus carpetas. `force` solo con confirmacion.
