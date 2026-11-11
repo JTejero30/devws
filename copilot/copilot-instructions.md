@@ -17,5 +17,6 @@ Este workspace tiene varios repos gestionados por devws (herramientas MCP `devws
 - `devws_start` con `force` (para otro espacio arrancado) y `devws_remove_workspace` solo con
   confirmacion explicita del usuario.
 - Para probar contra un entorno de referencia (p. ej. desa o inte) usa los entornos fijos
-  (`environments` en `devws_status`): `devws_start_environment` / `devws_stop_environment`.
+  (`environments` en `devws_status`): `devws_start_environment` / `devws_stop_environment` (`devws_update_environments` los
+  pone al dia con origin sin arrancarlos).
   Son solo lectura: no edites ni hagas commits en sus carpetas. `force` solo con confirmacion.

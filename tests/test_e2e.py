@@ -1440,3 +1440,54 @@ def test_entornos_fijos(ws):
     assert r["ok"] and r["deleted"] == [], r
     assert not wt_worker.exists() and not wt_api.exists() and "inte" not in c.get("/api/profiles")
     assert git_out(root / "commons" / "worker", "ls-remote", "--heads", "origin", "inte") != ""
+
+
+def test_actualizar_todos_los_entornos(ws):
+    """"Actualizar todos": fetch y cada worktree de los entornos parados en lo
+    ultimo de origin (los crea si faltan), sin arrancar nada. El arrancado no se
+    toca y uno con cambios locales tampoco: se avisa."""
+    c, dws, root = ws["c"], ws["dws"], ws["root"]
+    clone = root / "_clone_upd"
+    sh(root, "git", "clone", "-q", str(root / "_remotes" / "commons_worker.git"), str(clone))
+    sh(clone, "git", "config", "user.email", "test@devws")
+    sh(clone, "git", "config", "user.name", "test")
+    sh(clone, "git", "checkout", "-q", "-b", "upd")
+
+    def push(msg: str) -> str:
+        (clone / "UPD").write_text(msg)
+        sh(clone, "git", "add", ".")
+        sh(clone, "git", "commit", "-q", "-m", msg)
+        sh(clone, "git", "push", "-q", "origin", "HEAD:upd")
+        return git_out(clone, "rev-parse", "HEAD")
+
+    v1 = push("v1")
+    for n in ("upa", "upb", "upc"):
+        c.post("/api/profiles", {"name": n, "env_branch": "upd", "repos": {}, "services": ["worker"]})
+    prepare(c, "upa")
+    c.post("/api/profiles/upb/start?force=true")
+    wait_job(c, "upb")
+    wa, wb, wc = (dws / "worktrees" / f"{n}__worker" for n in ("upa", "upb", "upc"))
+    assert not wc.exists()
+
+    v2 = push("v2")
+    c.post("/api/environments/update")
+    wait_job(c, "__entornos")
+    assert git_out(wa, "rev-parse", "HEAD") == v2, "parado: al dia"
+    assert git_out(wc, "rev-parse", "HEAD") == v2, "sin worktree: se crea ya al dia"
+    assert git_out(wb, "rev-parse", "HEAD") == v1, "arrancado: no se toca"
+    envs = c.get("/api/state")["environments"]
+    assert envs["upa"]["repos"]["worker"]["behind"] == 0 and envs["upb"]["repos"]["worker"]["behind"] == 1
+    assert svc(c, "upb/worker")["status"] == "up" and svc(c, "upa/worker")["status"] == "other_space", "no se arranca nada"
+    assert any("upb: arrancado" in l for l in c.get("/api/logs/__entornos--actividad")["lines"])
+
+    # con cambios locales no se mueve: aviso en el trabajo
+    (wa / "local.txt").write_text("x")
+    push("v3")
+    err, r = mcp_tool(c, "devws_update_environments")
+    assert not err and r["status"] == "error" and "upa" in r["error"] and "cambios locales" in r["error"], r
+    assert git_out(wa, "rev-parse", "HEAD") == v2 and git_out(wc, "rev-parse", "HEAD") != v2
+
+    c.post("/api/profiles/upb/stop")
+    wait_job(c, "upb")
+    r = c.post("/api/cleanup/remove", {"spaces": ["upa", "upb", "upc"], "force": True})
+    assert r["ok"], r

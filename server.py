@@ -1009,15 +1009,17 @@ def head_in_branches(d: Path) -> bool:
                     "refs/heads", "refs/remotes").strip())
 
 
-def wt_ensure_readonly(name: str, branch: str, profile: str) -> str | None:
+def wt_ensure_readonly(name: str, branch: str, profile: str, fetch: bool = True) -> str | None:
     """Deja el worktree del repo para el perfil en HEAD detached en lo ultimo de
     `branch` (lo crea si no existe). Git impide tener la misma rama abierta en
     dos sitios, pero no el mismo commit: asi varios espacios pueden usar, p. ej.,
     desa a la vez. Si hay cambios sin commitear o commits que no estan en la
-    rama no lo mueve (no se pierde nada) y devuelve el aviso."""
+    rama no lo mueve (no se pierde nada) y devuelve el aviso. fetch=False: origin
+    ya se trajo antes (p. ej. al actualizar todos los entornos de una vez)."""
     p = repo_path(name)
     d = wt_dir_for(profile, name)
-    git(p, "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
+    if fetch:
+        git(p, "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
     target = git(p, "rev-parse", readonly_ref(p, name, branch)).strip()
     if d.exists():
         on_branch = git(d, "branch", "--show-current").strip()
@@ -1852,6 +1854,8 @@ def run_job(profile: str, action: str, append: bool = False) -> None:
             job_stop(job, prof)
         elif action == "fetch":
             errors = job_fetch(job)
+        elif action == "update_envs":
+            errors = job_update_envs(job)
         else:
             errors = job_start(job, prof, services_too=(action == "start"))
     except JobCancelled:
@@ -1865,7 +1869,7 @@ def run_job(profile: str, action: str, append: bool = False) -> None:
         nxt, _stop_after = _stop_after, None
         _set_job(profile, action=action, status="cancelled" if cancelled else "error" if errors else "ok",
                  error="; ".join(errors) or None, finished=time.strftime("%H:%M"))
-        if profile != FETCH_JOB:
+        if profile not in (FETCH_JOB, ENVS_JOB):
             note_used(profile)
         if nxt:  # se pidio parar mientras trabajaba: ahora toca parar
             _set_job(nxt, action="stop", status="running", step="parando…")
@@ -2168,11 +2172,12 @@ STALE_DAYS = 7  # dias sin tocar un espacio para avisar
 PROTECTED_BRANCHES = {"main", "master", "develop", "development", "dev", "desa", "inte", "int",
                       "pre", "preprod", "prod", "production", "staging", "release", "qa", "test", "uat"}
 FETCH_JOB = "__origin"  # trabajo "Comprobar con origin": ningun perfil puede llamarse asi
+ENVS_JOB = "__entornos"  # trabajo "Actualizar entornos" (tampoco es un perfil)
 SIZE_TTL = 600  # segundos que vale el tamaño medido de una carpeta
 
 
 def job_who(name: str) -> str:
-    return "la comprobación con origin" if name == FETCH_JOB else name
+    return {FETCH_JOB: "la comprobación con origin", ENVS_JOB: "la actualización de los entornos"}.get(name, name)
 
 
 def note_branch(profile: str, repo: str, branch: str, new: bool) -> None:
@@ -2464,6 +2469,48 @@ def cleanup_report() -> dict:
 @app.get("/api/cleanup")
 def api_cleanup():
     return cleanup_report()
+
+
+def job_update_envs(job: Job) -> list[str]:
+    """Actualizar entornos: git fetch de cada repo (una vez) y cada worktree de
+    los entornos parados en lo ultimo de origin/<rama> (los crea si faltan), sin
+    instalar ni arrancar nada: al levantarlos ya estan al dia. Los arrancados no
+    se tocan (cambiarles el codigo debajo los dejaria a medias): para esos esta
+    su "Actualizar", que los vuelve a levantar. Devuelve avisos y errores."""
+    state, errors, offline = load_state(), [], set()
+    envs = {n: p for n, p in env_profiles().items() if not space_ids(n, p, state)}
+    for n in env_profiles():
+        if n not in envs:
+            job.step(f"{n}: arrancado, no se toca (usa Actualizar en su tarjeta)")
+    for r in dict.fromkeys(r for p in envs.values() for r in p.get("repos", {})):
+        job.step(f"{r}: trayendo lo nuevo de origin")
+        try:
+            git(repo_path(r), "fetch", "--prune", "--quiet", timeout=120, cancellable=True)
+        except (RuntimeError, HTTPException) as e:
+            offline.add(r)
+            errors.append(f"{r}: {e.detail if isinstance(e, HTTPException) else e}")
+    for n, p in envs.items():
+        for r, b in p.get("repos", {}).items():
+            if r in offline:
+                continue
+            job.step(f"{n}: {r} a lo último de {b}")
+            try:
+                warn = wt_ensure_readonly(r, b, n, fetch=False)
+            except (RuntimeError, HTTPException) as e:
+                warn = f"{r}: {e.detail if isinstance(e, HTTPException) else e}"
+            if warn:
+                job.step(f"AVISO {n}: {warn}")
+                errors.append(f"{n}: {warn}")
+    return errors
+
+
+@app.post("/api/environments/update")
+def api_envs_update():
+    """Pone al dia con origin los worktrees de todos los entornos parados."""
+    if not env_profiles():
+        raise HTTPException(400, "no hay entornos")
+    start_job(ENVS_JOB, "update_envs")
+    return {"ok": True}
 
 
 @app.post("/api/cleanup/fetch")
@@ -2923,6 +2970,14 @@ def devws_start_environment(name: str, force: bool = False) -> dict:
     prof = env_or_error(name)
     tool_call(api_profile_start, name, force=force)
     return {**wait_job_done(name), **env_info(name, prof)}
+
+
+@mcp.tool()
+def devws_update_environments() -> dict:
+    """Pone al dia con origin todos los entornos parados (fetch y cada worktree
+    en lo ultimo de su rama), sin arrancarlos. Los arrancados no se tocan."""
+    tool_call(api_envs_update)
+    return {**wait_job_done(ENVS_JOB), "environments": [env_info(n, p) for n, p in env_profiles().items()]}
 
 
 @mcp.tool()

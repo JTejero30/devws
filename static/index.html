@@ -166,7 +166,7 @@ white-space:pre-wrap; word-break:break-all; color:#c9d1d9; }
 .cl-why { color:var(--dim); flex:1 1 260px; min-width:0; }
 .cl-row.dim .cl-name { color:var(--dim); }
 #pfNudge { margin:-4px 0 10px; color:var(--yellow); }
-.env-origin { display:flex; align-items:center; gap:8px; font-size:12px; margin-left:auto; }
+.env-origin { display:flex; align-items:center; flex-wrap:wrap; justify-content:flex-end; gap:4px 8px; font-size:12px; margin-left:auto; }
 .p-table .env-x { color:var(--dim); font-size:11px; }
 #pfNudge:empty { display:none; }
 </style>
@@ -353,8 +353,11 @@ let profiles = {};  // nombre -> perfil (toml)
 // limpieza (/api/cleanup): por espacio, ultimo uso, veredicto y estado de sus ramas
 let cleanup = null, cleanupAt = 0, cleanupLoading = false, cleanupRetry = null;
 const FETCH_JOB = "__origin";  // trabajo "Comprobar con origin" (no es un espacio)
+const ENVS_JOB = "__entornos";  // trabajo "Actualizar entornos" (tampoco)
+const JOB_LABEL = { [FETCH_JOB]: "Comprobar con origin", [ENVS_JOB]: "Actualizar entornos" };
 const busyJob = () => Object.entries(jobs).find(([, j]) => j.status === "running");
 const busyWhy = ([n, j]) => n === FETCH_JOB ? "Espera: se está comprobando con origin"
+: n === ENVS_JOB ? "Espera: se están actualizando los entornos"
 : `Espera: ${n} está ${({ start: "arrancando", stop: "parando", prepare: "preparando sus worktrees", install: "instalando dependencias" })[j.action] || "trabajando"}`;
 const spaceClean = name => cleanup && cleanup.spaces[name];
 const repoHealth = (name, r) => { const s = spaceClean(name), e = s && s.repos.find(x => x.repo === r); return e && e.health; };
@@ -493,9 +496,9 @@ function renderActive() {
 const job = busyJob();
 if (job) {
 const [name, j] = job;
-return setActive("busy", `<b>${esc(name === FETCH_JOB ? "Comprobar con origin" : name)}</b>: ${esc(j.step || "trabajando…")}${elapsed(name)}`,
+return setActive("busy", `<b>${esc(JOB_LABEL[name] || name)}</b>: ${esc(j.step || "trabajando…")}${elapsed(name)}`,
 `<button class="link" data-k="hdr-act" onclick="openLogs('${esc(name)}', 'actividad')">actividad</button>`
-+ (!["stop", "fetch"].includes(j.action) ? ` <button class="stop" data-k="primary" onclick="stopProfile('${esc(name)}')">Parar</button>` : ""));
++ (!["stop", "fetch", "update_envs"].includes(j.action) ? ` <button class="stop" data-k="primary" onclick="stopProfile('${esc(name)}')">Parar</button>` : ""));
 }
 const prof = (activeProfile && profiles[activeProfile]) || Object.values(profiles).find(isRunning);
 if (prof) {
@@ -780,10 +783,24 @@ paint(el, envCard(p));
 const ats = list.map(p => (envState[p.name] || {}).fetched_at).filter(x => x !== undefined);
 const at = ats.length && !ats.includes(null) ? Math.min(...ats) : null;
 const busy = busyJob(), fj = jobs[FETCH_JOB], fetching = fj && fj.status === "running";
-const btn = !list.length || fetching ? "" : busy ? offBtn("link", "Comprobar con origin", "env-fetch", busyWhy(busy))
+const uj = jobs[ENVS_JOB], updating = uj && uj.status === "running";
+const act = `<a href="#" data-k="env-act" onclick="openLogs('${ENVS_JOB}','actividad');return false">ver actividad</a>`;
+const btn = !list.length || fetching || updating ? "" : busy ? offBtn("link", "Comprobar con origin", "env-fetch", busyWhy(busy))
 : `<button class="link" data-k="env-fetch" onclick="cleanupFetch()" title="git fetch de todos los repos: así se sabe si los entornos tienen commits nuevos">Comprobar con origin</button>`;
-paint($("#envOrigin"), !list.length ? "" : (fetching ? `<span class="warn-t">${esc(fj.step || "comprobando con origin…")}</span>`
-: `<span class="hint">${at ? `origin consultado ${ago(at)}` : "origin sin consultar"}</span>`) + btn);
+const upd = !list.length || updating ? "" : busy ? offBtn("", "Actualizar todos", "env-upd", busyWhy(busy))
+: `<button data-k="env-upd" onclick="updateAllEnvs()" title="trae lo último de origin y pone ahí los entornos parados, sin arrancarlos: al levantarlos ya están al día. Los arrancados no se tocan (usa Actualizar en su tarjeta)">Actualizar todos</button>`;
+const status = updating ? `<span class="warn-t">${esc(uj.step || "actualizando entornos…")}${elapsed(ENVS_JOB)}</span> ${act}`
+: fetching ? `<span class="warn-t">${esc(fj.step || "comprobando con origin…")}</span>`
+: uj && uj.status === "error" && !dismissed.has(dismissKey(ENVS_JOB, uj))
+? `<span class="warn-t" title="${esc(uj.error)}">Actualizados con avisos (${esc(uj.finished || "")}): ${esc(uj.error)}</span> ${act}`
++ ` <button class="link x" data-k="env-dismiss" onclick="dismissJob('${ENVS_JOB}')" title="ocultar este aviso" aria-label="ocultar este aviso">×</button>`
+: `<span class="hint">${at ? `origin consultado ${ago(at)}` : "origin sin consultar"}</span>`;
+paint($("#envOrigin"), !list.length ? "" : status + btn + upd);
+}
+async function updateAllEnvs() {
+try { await post("/api/environments/update"); } catch (e) { return toast(e.message, true); }
+optimistic(ENVS_JOB, "update_envs");
+kick();
 }
 async function updateEnv(name) {
 if (!confirm(`¿Actualizar ${name}?\n\nSe paran sus servicios, se trae lo último de origin y se vuelven a levantar.`)) return;
@@ -1620,11 +1637,11 @@ let modalTimer = null, modalSvc = null, modalServices = [], terms = [];
 
 function openLogs(profileName, tab) {
 const p = profiles[profileName];
-if (!p && profileName !== FETCH_JOB) return;
+if (!p && !JOB_LABEL[profileName]) return;
 const act = `${profileName}--actividad`;
 modalServices = p ? [act, ...profSvcs(p).map(n => svcId(p, n))] : [act];
 $("#logModal").style.display = "flex";
-$("#logModalTitle").textContent = `Logs · ${p ? profileName : "Comprobar con origin"}`;
+$("#logModalTitle").textContent = `Logs · ${p ? profileName : JOB_LABEL[profileName]}`;
 selectLogTab(tab === "actividad" ? act : (tab || modalServices[1] || act));
 }
 

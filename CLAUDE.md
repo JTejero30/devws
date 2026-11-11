@@ -73,10 +73,14 @@ node/npm y uv en el PATH. Todo cambio va con su test.
   excepcion en `[repos]`. Se levantan como un espacio (mismo trabajo, mismos
   puertos, solo uno activo). `/api/state` da `environments`: por repo, commits de
   origin que le faltan (`behind`, con lo ya traido; sin fetch), rama que no esta
-  en origin (`missing`) y ficheros cambiados. "Actualizar" = volver a levantar.
+  en origin (`missing`) y ficheros cambiados. "Actualizar" (tarjeta) = volver a
+  levantar. "Actualizar todos" (`/api/environments/update`, trabajo `__entornos`):
+  fetch de cada repo una vez y los worktrees de los entornos parados en lo
+  ultimo de origin (los crea si faltan), sin instalar ni arrancar; los
+  arrancados no se tocan y uno con cambios locales se avisa.
   No salen en Limpieza (nunca sobran) y un espacio no se convierte en entorno ni
-  al reves. MCP: `environments` en devws_status, devws_start_environment y
-  devws_stop_environment.
+  al reves. MCP: `environments` en devws_status, devws_start_environment,
+  devws_stop_environment y devws_update_environments.
 - Dependencias de un worktree: solo al arrancarlo o con "instalar", y solo si
   cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`).
 - `git fetch --prune` solo al hacer checkout, crear worktree, "Comprobar con
