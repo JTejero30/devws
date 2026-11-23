@@ -22,6 +22,24 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel
 
+
+def ensure_std_fds() -> None:
+    """Si a devws lo lanzan con stdin/stdout/stderr cerrados (p. ej. desde un
+    terminal o una herramienta que ya los cerro), ocupa esos fd con /dev/null.
+    Si no, el primer fichero que se abra cae en el fd 0 y cualquier hijo que los
+    herede (o el propio servidor) falla con "Bad file descriptor"."""
+    for fd in (0, 1, 2):
+        try:
+            os.fstat(fd)
+        except OSError:
+            null = os.open(os.devnull, os.O_RDWR)
+            if null != fd:
+                os.dup2(null, fd)
+                os.close(null)
+
+
+ensure_std_fds()
+
 ROOT = Path(__file__).resolve().parent
 WORKSPACE_ROOT = ROOT.parent
 CONFIG = tomllib.load(open(ROOT / "config.toml", "rb"))
@@ -116,10 +134,12 @@ def git(repo_dir: Path, *args: str, timeout: int = 90, cancellable: bool = False
     para operaciones que se pueden cortar sin dejar nada a medias: fetch)."""
     cmd = ["git", "-C", str(repo_dir), *args]
     if not cancellable:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                             stdin=subprocess.DEVNULL)
         rc, out, err = res.returncode, res.stdout, res.stderr
     else:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                stdin=subprocess.DEVNULL)
         rc, out, err = run_cancellable(proc, timeout)
     if rc != 0:
         raise RuntimeError(git_msg(err.strip() or out.strip()))
@@ -842,7 +862,7 @@ def wait_port_free(port: int, timeout: float = 15.0) -> bool:
 def _ref_exists(repo_dir: Path, ref: str) -> bool:
     res = subprocess.run(
         ["git", "-C", str(repo_dir), "show-ref", "--verify", "--quiet", ref],
-        capture_output=True, text=True,
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
     )
     return res.returncode == 0
 
@@ -876,7 +896,7 @@ def default_branch(p: Path) -> str | None:
 def is_ancestor(repo_dir: Path, a: str, b: str) -> bool:
     """El commit `a` ya esta en `b` (b es a o viene de a)."""
     return subprocess.run(["git", "-C", str(repo_dir), "merge-base", "--is-ancestor", a, b],
-                          capture_output=True).returncode == 0
+                          capture_output=True, stdin=subprocess.DEVNULL).returncode == 0
 
 
 def ff_to_origin(p: Path, name: str, branch: str) -> str | None:
@@ -1099,7 +1119,8 @@ def uv_sync_many(targets: list[str]) -> None:
     for name in targets:
         try:
             p = repo_path(name)
-            subprocess.run(["uv", "sync"], cwd=p, capture_output=True, text=True, timeout=600)
+            subprocess.run(["uv", "sync"], cwd=p, capture_output=True, text=True, timeout=600,
+                           stdin=subprocess.DEVNULL)
         except Exception:
             pass
 
@@ -1225,7 +1246,7 @@ def _start_service(svc: dict, port: int, killed: list,
                 f.write(f"=== up {name} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
         with open(logf_path, "ab") as logf:
             proc = subprocess.Popen(
-                cmd, cwd=p, stdout=logf, stderr=subprocess.STDOUT,
+                cmd, cwd=p, stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
                 start_new_session=True, env=env,
             )
         try:
@@ -1698,7 +1719,7 @@ class Job:
     def run(self, cmd: list[str], cwd: Path, timeout: int) -> int:
         with open(self.log, "ab") as fh:
             proc = subprocess.Popen([shutil.which(cmd[0]) or cmd[0], *cmd[1:]], cwd=cwd,
-                                    stdout=fh, stderr=subprocess.STDOUT)
+                                    stdin=subprocess.DEVNULL, stdout=fh, stderr=subprocess.STDOUT)
             return run_cancellable(proc, timeout)[0]
 
 
@@ -2134,7 +2155,8 @@ def api_wt_open(name: str):
     ws_file = WS_DIR / f"{name}.code-workspace"
     ws_file.parent.mkdir(parents=True, exist_ok=True)
     ws_file.write_text(json.dumps({"folders": [{"path": d} for d in dirs]}, indent=2))
-    subprocess.Popen([code, "--new-window", str(ws_file)], start_new_session=True)
+    subprocess.Popen([code, "--new-window", str(ws_file)], start_new_session=True,
+                     stdin=subprocess.DEVNULL)
     return {"ok": True, "opened": str(ws_file), "folders": dirs}
 
 
@@ -2239,7 +2261,7 @@ def integrated(p: Path, ref: str, dest: str) -> tuple[int, bool | None]:
         merges = git(p, "rev-list", "--merges", "--parents", f"{tip}..{dest}").splitlines()
         return 0, any(tip in line.split()[2:] for line in merges)
     res = subprocess.run(["git", "-C", str(p), "merge-tree", "--write-tree", dest, ref],
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if res.returncode not in (0, 1):  # 1 = con conflictos: no esta dentro
         return own, None
     return own, res.stdout.split("\n", 1)[0].strip() == git(p, "rev-parse", f"{dest}^{{tree}}").strip()
@@ -2320,7 +2342,8 @@ def _measure(dirs: list[Path]) -> None:
     for d in dirs:
         try:
             if du:  # -s sin seguir enlaces (el .github del worktree apunta al original)
-                out = subprocess.run([du, "-sk", str(d)], capture_output=True, text=True, timeout=300).stdout
+                out = subprocess.run([du, "-sk", str(d)], capture_output=True, text=True,
+                                     timeout=300, stdin=subprocess.DEVNULL).stdout
                 size = int(out.split()[0]) * 1024
             else:
                 size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file() and not f.is_symlink())
