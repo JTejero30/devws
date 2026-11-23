@@ -196,8 +196,12 @@ consumers = ["api"]
     server = {}
 
     def start():
+        # Con stdin cerrado, como cuando se lanza desde un terminal que ya lo
+        # cerro: ni el servidor ni lo que arranca (servicios, instaladores)
+        # pueden depender de heredarlo.
         server["proc"] = subprocess.Popen([sys.executable, str(dws / "server.py")], cwd=dws,
-                                          stdout=log, stderr=subprocess.STDOUT, env=env)
+                                          stdout=log, stderr=subprocess.STDOUT, env=env,
+                                          preexec_fn=close_stdin if os.name != "nt" else None)
         wait_for(lambda: fetch(ports["web_ui"]) is not None, 30, "server devws")
 
     def stop():
@@ -213,6 +217,10 @@ consumers = ["api"]
             c.post(f"/api/services/{urllib.parse.quote(s['id'], safe='')}/down", ok=False)
     stop()
     log.close()
+
+
+def close_stdin() -> None:
+    os.close(0)
 
 
 def svc(c: Client, sid: str) -> dict:
@@ -248,6 +256,8 @@ def test_up_down_in_place(ws):
     assert r["ok"] and "up en" in r["msg"], r
     assert fetch(ports["api"]) == str(ws["root"] / "api")
     assert svc(c, "api")["status"] == "up"
+    if sys.platform == "linux":  # el servicio no hereda el stdin (cerrado) del servidor
+        assert os.readlink(f"/proc/{r['pid']}/fd/0") == os.devnull
     c.post("/api/services/api/down")
     wait_for(lambda: fetch(ports["api"]) is None, 15, "api caido")
     assert svc(c, "api")["status"] == "down"
