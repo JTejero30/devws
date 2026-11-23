@@ -1737,16 +1737,21 @@ def deps_install(job: Job, rname: str, d: Path) -> None:
     if rc != 0:
         raise RuntimeError(f"{rname}: fallo la instalacion de dependencias (codigo {rc})")
     # despues de instalar: uv sync / npm install pueden crear o tocar el lockfile
-    deps_stamp_file(d).write_text(deps_hash(rname, d))
+    WT_DIR.mkdir(exist_ok=True)
+    deps_stamp_file(rname, d).write_text(deps_hash(rname, d))
 
 
 # ficheros que definen las dependencias: si no cambian, no se reinstala
 DEPS_FILES = ("uv.lock", "pyproject.toml", "requirements.txt", "package-lock.json", "package.json")
 
 
-def deps_stamp_file(d: Path) -> Path:
-    # junto al worktree, no dentro: dentro saldria como fichero sin versionar
-    return d.with_name(d.name + ".deps")
+def deps_stamp_file(rname: str, d: Path) -> Path:
+    # junto al worktree, no dentro: dentro saldria como fichero sin versionar.
+    # El de la carpeta original de un repo, en worktrees/ de devws (no se ensucia
+    # la carpeta del usuario): <repo>.deps, que no choca con <perfil>__<repo>.deps
+    if d.parent == WT_DIR:
+        return d.with_name(d.name + ".deps")
+    return WT_DIR / f"{rname}.deps"
 
 
 def deps_hash(rname: str, d: Path) -> str:
@@ -1765,7 +1770,7 @@ def deps_needed(rname: str, d: Path) -> bool:
     r = next((r for r in repos() if r["name"] == rname), {})
     if not install_cmd(r):
         return False
-    f = deps_stamp_file(d)
+    f = deps_stamp_file(rname, d)
     return not f.exists() or f.read_text().strip() != deps_hash(rname, d)
 
 
@@ -1777,7 +1782,7 @@ def deps_missing(rname: str, d: Path) -> bool:
         return False
     # el instalador ya corrio con estos ficheros y no creo la carpeta: el repo no
     # tiene dependencias que instalar (npm install sin dependencias no crea node_modules)
-    f = deps_stamp_file(d)
+    f = deps_stamp_file(rname, d)
     return not (f.exists() and f.read_text().strip() == deps_hash(rname, d))
 
 
@@ -1843,11 +1848,33 @@ def job_start(job: Job, prof: dict, services_too: bool = True) -> list[str]:
     with state_tx() as st:
         st["active_profile"] = job.profile
     svcs = profile_services(prof)
+    errors += deps_originals(job, [f"{job.profile}/{s}" if is_wt else s for s in svcs])
     for i, s in enumerate(svcs, 1):
         job.step(f"arrancando {s} ({i}/{len(svcs)})")
         r = api_up(f"{job.profile}/{s}" if is_wt else s, force=True)
         if not r.get("ok") or r.get("warn"):
             errors.append(f"{s}: {r.get('warn') or r.get('msg')}")
+    return errors
+
+
+def deps_originals(job: Job, sids: list[str]) -> list[str]:
+    """Dependencias de los repos cuyos servicios corren desde su carpeta original
+    (no estan en el espacio, o es in-place), con el mismo criterio que los
+    worktrees: solo si faltan o cambiaron sus lockfiles desde la ultima vez. Si
+    falla se avisa y se arranca igual: puede que el servicio funcione."""
+    errors, seen = [], set()
+    for sid in sids:
+        svc, _, _, p, wt_dir = _svc_ctx(sid)
+        rname = svc["repo"]
+        if wt_dir is not None or rname in seen:
+            continue
+        seen.add(rname)
+        if deps_needed(rname, p):
+            try:
+                deps_install(job, rname, p)
+            except RuntimeError as e:
+                job.step(f"AVISO {e}")
+                errors.append(str(e))
     return errors
 
 
@@ -2085,7 +2112,7 @@ def wt_remove_dirs(dirs: list[tuple[str, Path]], force: bool) -> list[str]:
     for rname, d in dirs:
         try:
             git(repo_path(rname), "worktree", "remove", "--force", str(d), timeout=120)
-            deps_stamp_file(d).unlink(missing_ok=True)
+            deps_stamp_file(rname, d).unlink(missing_ok=True)
         except (RuntimeError, HTTPException) as e:
             errs.append(f"{rname}: {e.detail if isinstance(e, HTTPException) else e}")
     return errs

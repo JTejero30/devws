@@ -82,7 +82,12 @@ node/npm y uv en el PATH. Todo cambio va con su test.
   al reves. MCP: `environments` en devws_status, devws_start_environment,
   devws_stop_environment y devws_update_environments.
 - Dependencias de un worktree: solo al arrancarlo o con "instalar", y solo si
-  cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`).
+  cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`). Las de la
+  carpeta original de un repo cuyo servicio arranca un espacio (no esta en el
+  espacio, o es in-place): igual, al arrancar (sello `worktrees/<repo>.deps`);
+  si fallan se avisa y se arranca igual.
+- Todo proceso hijo lleva stdin=/dev/null, y el servidor rellena los fd 0/1/2
+  que le falten al arrancar (si no, Python muere con "Bad file descriptor").
 - `git fetch --prune` solo al hacer checkout, crear worktree, "Comprobar con
   origin" o pedir el plan de borrado de un espacio.
 - Al abrir una rama que ya existe en local (crear su worktree, cambiar de rama o

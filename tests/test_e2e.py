@@ -1075,6 +1075,36 @@ def test_dependencias_solo_si_cambian_sus_ficheros(ws):
     c.delete("/api/profiles/dhash")
 
 
+def test_dependencias_de_la_carpeta_original_al_arrancar(ws):
+    """Un servicio cuyo repo no esta en el espacio corre desde la carpeta
+    original: tambien se le instalan las dependencias si cambian sus ficheros."""
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    stamp, pyproject = dws / "worktrees" / "api.deps", root / "api" / "pyproject.toml"
+    stamp.unlink(missing_ok=True)
+    orig = pyproject.read_text()
+    c.post("/api/profiles", {"name": "dorig", "repos": {"lib": "dorig-a"}, "bases": {"lib": "main"},
+                             "services": ["api"], "worktree": True})
+
+    def start() -> list[str]:
+        c.post("/api/profiles/dorig/start")
+        wait_job(c, "dorig")
+        return c.get("/api/logs/dorig--actividad")["lines"]
+
+    try:
+        assert any("api: instalando dependencias" in l for l in start())
+        assert stamp.exists() and (root / "api" / ".venv").is_dir()
+        assert not any("api: instalando" in l for l in start()), "sin cambios: no reinstala"
+        pyproject.write_text(orig + "\n# cambio\n")
+        assert any("api: instalando dependencias" in l for l in start()), "cambio pyproject.toml"
+        assert not (root / "api" / "api.deps").exists(), "el sello no ensucia la carpeta original"
+    finally:
+        pyproject.write_text(orig)
+        c.post("/api/profiles/dorig/stop")
+        wait_job(c, "dorig")
+        c.delete("/api/worktrees/dorig?force=true")
+        c.delete("/api/profiles/dorig")
+
+
 def test_adoptar_en_perfil_nuevo_arranca_todos_los_servicios(ws):
     c, dws = ws["c"], ws["dws"]
     sh(ws["root"] / "commons" / "worker", "git", "worktree", "add", "-q", "-b", "adop2-w",
