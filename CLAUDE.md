@@ -81,6 +81,15 @@ node/npm y uv en el PATH. Todo cambio va con su test.
   No salen en Limpieza (nunca sobran) y un espacio no se convierte en entorno ni
   al reves. MCP: `environments` en devws_status, devws_start_environment,
   devws_stop_environment y devws_update_environments.
+- Librerias en local: si una `[[libraries]]` python esta en el espacio (no en
+  solo lectura), sus consumidores la usan desde el codigo del espacio (su
+  worktree, o la carpeta original en in-place; `src/` si la tiene): devws la pone
+  delante en el PYTHONPATH del servicio al arrancarlo, aunque el servicio corra
+  desde su carpeta original. No se toca ningun venv: no hay nada que desmontar.
+  `published_libs = [...]` en el perfil = usar la version publicada (la del venv).
+  En `/api/state` cada servicio da `local_libs` (las que tenia al arrancar si
+  corre) y `libs_stale` si el espacio ya pide otras (hay que reiniciarlo). Limite:
+  las dependencias nuevas de la libreria no se instalan. npm: no aplica.
 - Dependencias de un worktree: solo al arrancarlo o con "instalar", y solo si
   cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`). Las de la
   carpeta original de un repo cuyo servicio arranca un espacio (no esta en el
