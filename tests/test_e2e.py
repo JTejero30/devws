@@ -1608,3 +1608,35 @@ def test_libreria_en_local_en_espacio_in_place(ws):
         (root / "lib" / ".git" / "info" / "exclude").write_text("")
         sh(root / "lib", "git", "checkout", "-q", "main")
     assert svc(c, "api")["local_libs"] == [], "sin espacio activo, la version instalada"
+
+
+def test_rutas_ignoradas_del_env_se_copian_al_worktree(ws):
+    """El .env del original apunta (CONFIG_PATH) a una carpeta que git ignora:
+    el worktree no la tiene y el servicio fallaria; se copia al arrancarlo."""
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    api, exclude = root / "api", root / "api" / ".git" / "info" / "exclude"
+    env_orig = (api / ".env").read_text()
+    (api / "conf" / "local").mkdir(parents=True)
+    (api / "conf" / "local" / "settings.txt").write_text("x")
+    exclude.write_text("conf/\n")
+    (api / ".env").write_text(env_orig + "CONFIG_PATH=conf/local\nURL=http://x/conf\nNADA=no/existe\n")
+    c.post("/api/profiles", {"name": "envp", "repos": {"api": "envp-a"}, "bases": {"api": "main"},
+                             "services": ["api"], "worktree": True})
+    wt = dws / "worktrees" / "envp__api"
+    try:
+        c.post("/api/profiles/envp/start")
+        wait_job(c, "envp")
+        assert (wt / "conf" / "local" / "settings.txt").read_text() == "x"
+        assert not (wt / "no").exists()
+        assert "copiado del repo original" in (dws / "logs" / "envp--api.log").read_text()
+        (wt / "conf" / "local" / "settings.txt").write_text("editado")
+        restart(c, "/api/services/wt/envp/api")
+        assert (wt / "conf" / "local" / "settings.txt").read_text() == "editado", "nunca sobrescribe"
+    finally:
+        c.post("/api/profiles/envp/stop")
+        wait_job(c, "envp")
+        c.delete("/api/worktrees/envp?force=true")
+        c.delete("/api/profiles/envp")
+        (api / ".env").write_text(env_orig)
+        exclude.write_text("")
+        shutil.rmtree(api / "conf")

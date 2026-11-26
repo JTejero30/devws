@@ -1015,6 +1015,32 @@ def wt_copy_ignored(name: str, d: Path) -> None:
             shutil.copy2(src, dst)
 
 
+def wt_copy_env_paths(src_root: Path, d: Path) -> list[str]:
+    """Rutas relativas del .env del repo original (p. ej. CONFIG_PATH=infra/
+    environments/local) que git ignora y que el worktree no tiene: se copian del
+    original para que el servicio arranque (sin ellas falla al leer su config).
+    Nunca sobrescribe. Devuelve las copiadas."""
+    out = []
+    for v in load_dotenv(src_root).values():
+        rel = Path(v)
+        if not v or "://" in v or rel.is_absolute() or ".." in rel.parts or str(rel) == ".":
+            continue
+        src, dst = src_root / rel, d / rel
+        if not src.exists() or dst.exists():
+            continue
+        ignored = subprocess.run(["git", "-C", str(src_root), "check-ignore", "-q", str(rel)],
+                                 capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+        if ignored.returncode != 0:
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+        out.append(v)
+    return out
+
+
 def wt_dir_for(profile: str, repo: str) -> Path:
     return WT_DIR / f"{profile}__{repo}"
 
@@ -1271,6 +1297,7 @@ def _start_service(svc: dict, port: int, killed: list,
     dotenv_p = repo_path(svc["repo"]) if wt_dir is not None else p
     for k, v in load_dotenv(dotenv_p).items():
         env.setdefault(k, v)
+    copied = wt_copy_env_paths(dotenv_p, p) if wt_dir is not None else []
     libs = local_libs(name)
     if libs:
         # el codigo local de la libreria por delante de la version instalada en el venv
@@ -1287,6 +1314,9 @@ def _start_service(svc: dict, port: int, killed: list,
         if attempt == 1:
             with open(logf_path, "wb") as f:
                 f.write(f"=== up {name} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
+                if copied:
+                    f.write(f"devws: copiado del repo original (lo nombra su .env y git lo ignora): "
+                            f"{', '.join(copied)}\n".encode())
         with open(logf_path, "ab") as logf:
             proc = subprocess.Popen(
                 cmd, cwd=p, stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,

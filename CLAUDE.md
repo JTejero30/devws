@@ -90,6 +90,10 @@ node/npm y uv en el PATH. Todo cambio va con su test.
   En `/api/state` cada servicio da `local_libs` (las que tenia al arrancar si
   corre) y `libs_stale` si el espacio ya pide otras (hay que reiniciarlo). Limite:
   las dependencias nuevas de la libreria no se instalan. npm: no aplica.
+- `.env` de un servicio en worktree: se usa el del repo original. Las rutas
+  relativas que nombra (p. ej. `CONFIG_PATH=infra/environments/local`) y que git
+  ignora se copian del original al worktree al arrancar si faltan (nunca se
+  sobrescriben); se apunta en el log del servicio.
 - Dependencias de un worktree: solo al arrancarlo o con "instalar", y solo si
   cambian sus lockfiles (sello `worktrees/<perfil>__<repo>.deps`). Las de la
   carpeta original de un repo cuyo servicio arranca un espacio (no esta en el
