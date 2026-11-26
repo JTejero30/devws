@@ -361,6 +361,9 @@ def api_repos():
             st["kind"] = r["kind"]
             st["startup"] = repo_startup(r["name"])
             st["install"] = install_cmd(r)
+            lib = next((l for l in CONFIG.get("libraries", []) if l["name"] == r["name"]), None)
+            if lib:
+                st["consumers"] = lib.get("consumers", [])
             out.append(st)
         except Exception as e:
             out.append({"name": r["name"], "error": str(e)})

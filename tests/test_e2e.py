@@ -1559,15 +1559,16 @@ def test_libreria_del_espacio_en_local_para_sus_consumidores(ws):
         (lib_wt / "src").mkdir()
         (lib_wt / "src" / "libmod.py").write_text('VALUE = "v1"\n')
         assert svc(c, "libloc/api")["local_libs"] == ["lib"]
+        assert next(r for r in c.get("/api/repos") if r["name"] == "lib")["consumers"] == ["api"]
         c.post("/api/profiles/libloc/start")
         wait_job(c, "libloc")
         assert fetch(port, "/lib") == "v1"
         assert fetch(port) == str(ws["root"] / "api"), "corre desde su carpeta original"
         assert svc(c, "libloc/api")["local_libs"] == ["lib"]
         # cambio en la libreria: se ve al reiniciar el servicio, sin pasos a mano
-        (lib_wt / "src" / "libmod.py").write_text('VALUE = "v2"\n')
+        (lib_wt / "src" / "libmod.py").write_text('VALUE = "version 2"\n')  # otro tamaño: el .pyc del mismo segundo no vale
         restart(c, "/api/services/wt/libloc/api")
-        assert fetch(port, "/lib") == "v2"
+        assert fetch(port, "/lib") == "version 2"
         # publicada: el espacio ya no la cablea; hasta reiniciar se avisa
         c.put("/api/profiles", {**prof, "published_libs": ["lib"]})
         assert c.get("/api/profiles/libloc")["published_libs"] == ["lib"]
