@@ -74,6 +74,7 @@ column-gap:12px; font-size:12px; align-items:start; margin-top:4px; }
 .svc button.link { padding:0 2px; font-size:12px; }
 .svc-why { color:#ff7b72; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .badge.ro { color:#79c0ff; border-color:#79c0ff66; }
+.badge.lib { color:var(--green); border-color:#3fb95066; }
 .badge.muted { border-style:dashed; }
 .warn-t { color:var(--yellow); }
 .p-others { font-size:12px; margin-top:8px; }
@@ -536,8 +537,17 @@ else if (["down", "crashed"].includes(v.st)) acts.push(link("arrancar", `svcStar
 if (v.st === "crashed") acts.push(link("log", `openLogs('${esc(p.name)}','${id}')`, "l", "ver su log"));
 const why = v.st === "external" ? ` title="otro programa usa el puerto :${d.port}; al arrancar, devws lo para si es de desarrollo"` : "";
 return `<div class="svc"><span class="svc-n">${k} <span class="hint">:${d.port || "?"}</span></span>`
-+ `<span class="badge ${cls}"${why}>${esc(stLabel(v))}</span>${acts.join("")}</div>`
++ `<span class="badge ${cls}"${why}>${esc(stLabel(v))}</span>${libsHtml(v.s)}${acts.join("")}</div>`
 + (v.st === "crashed" && v.s && v.s.last_line ? `<div class="svc-why" title="${esc(v.s.last_line)}">${esc(v.s.last_line)}</div>` : "");
+}
+// librerias que el servicio importa del codigo del espacio (y si hay que
+// reiniciarlo porque el espacio ya pide otra cosa)
+function libsHtml(s) {
+if (!s) return "";
+const on = s.local_libs || [], want = s.libs_stale;
+let out = on.map(l => `<span class="badge lib" title="importa ${esc(l)} del código de este espacio, no la versión publicada de su venv">lib local: ${esc(l)}</span>`).join("");
+if (want) out += ` <span class="warn-t" title="el espacio ha cambiado de dónde coge sus librerías">· reinicia para usar ${want.length ? esc(want.join(", ")) + " en local" : "las publicadas"}</span>`;
+return out;
 }
 function origBranchSelect(r) {
 const ri = repoOf(r);
@@ -552,6 +562,13 @@ branchEdit = `${prof}|${r}`;
 renderProfiles();
 const s = $("#profilesList").querySelector(`[data-p="${CSS.escape(prof)}"] [data-k="chgsel:${CSS.escape(r)}"]`);
 if (s) s.focus();
+}
+// de donde cogen sus consumidores una libreria del espacio
+function libWhere(p, r) {
+const ri = repoOf(r), cons = (ri.consumers || []).join(", ");
+if (!(r in (p.repos || {})) || ri.kind !== "python" || !cons) return "";
+if ((p.readonly || []).includes(r) || (p.published_libs || []).includes(r)) return ` · ${esc(cons)} usan la publicada`;
+return ` · ${esc(cons)} la usan en local`;
 }
 function repoRows(p, active, working) {
 const wt = p.worktree === true, pr = p.repos || {}, bases = p.bases || {}, ro = p.readonly || [];
@@ -595,7 +612,7 @@ else br = code(cur || "sin rama") + (inProf && !wt ? (h => h && h.branch === wan
 }
 const svcs = psv.filter(n => svcDef(n).repo === r);
 const cell = svcs.length ? svcs.map(n => svcHtml(p, n, active, working)).join("")
-: `<span class="hint">${ri.startup === "library" ? "librería" : ri.startup ? "no arranca en este espacio" : ri.name ? "sin arranque configurado" : ""}</span>`;
+: `<span class="hint">${ri.startup === "library" ? "librería" + libWhere(p, r) : ri.startup ? "no arranca en este espacio" : ri.name ? "sin arranque configurado" : ""}</span>`;
 return `<div class="td repo">${esc(r)}</div><div class="td">${where}</div><div class="td">${br}</div><div class="td">${cell}</div>`
 + (notes.length ? `<div class="note">⚠ ${notes.join(" · ")}</div>` : "");
 }).join("");
@@ -1076,7 +1093,7 @@ paint($("#pfNudge"), surplus.length >= 3 ? `Tienes ${surplus.length} espacios qu
 $("#pfName").value = name || "";
 $("#pfName").disabled = !!name;
 document.querySelector(`input[name=pfMode][value=${p && p.worktree !== true ? "inplace" : "wt"}]`).checked = true;
-renderFormRepos(p ? p.repos || {} : {}, p ? p.bases || {} : {}, p ? p.readonly || [] : []);
+renderFormRepos(p ? p.repos || {} : {}, p ? p.bases || {} : {}, p ? p.readonly || [] : [], p ? p.published_libs || [] : []);
 const cur = p ? profSvcs(p) : allServiceNames();
 formSvcOrder = [...cur, ...allServiceNames().filter(n => !cur.includes(n))];
 formSvcSelected = new Set(cur);
@@ -1088,7 +1105,7 @@ refreshRepos().then(pfRefreshAll);
 }
 
 // cada repo: no incluir | rama existente | rama nueva desde una base
-function renderFormRepos(current, bases, readonly) {
+function renderFormRepos(current, bases, readonly, published = []) {
 $("#pfRepos").innerHTML = "<div class='sect' style='margin-top:10px'>Ramas</div>"
 + "<div class='hint' style='margin-bottom:4px'>Elige solo los repos en los que vas a trabajar. "
 + "Los no incluidos se quedan como están (sus servicios corren desde la carpeta original).</div>"
@@ -1107,6 +1124,11 @@ ${branches.map(b => `<option value="${esc(b)}" data-b="${esc(b)}" ${b === cur ? 
 <label class="pf-ro" style="display:${cur && !isNew ? "inline-flex" : "none"};width:auto;gap:4px;align-items:center"
 title="Para repos en los que no vas a desarrollar (p. ej. un servicio en desa): el worktree se queda en lo último de la rama sin abrirla, así otros espacios pueden usar la misma rama a la vez. No hagas commits ahí.">
 <input type="checkbox" data-pfro="${esc(r.name)}" ${readonly.includes(r.name) ? "checked" : ""} onchange="pfRefresh(this.closest('.row'))"> solo lectura</label>
+${r.kind === "python" && (r.consumers || []).length ? `<label class="pf-lib" style="display:none;width:auto;gap:4px;align-items:center"
+title="En local: los servicios que usan la librería importan el código de este espacio en vez de la versión publicada instalada en su venv. Cambias la librería, reinicias el servicio y lo ves. Publicada: la de su venv, como siempre.">
+<span class="hint">${esc(r.consumers.join(", "))} la usa${r.consumers.length > 1 ? "n" : ""}</span>
+<select data-pflib="${esc(r.name)}" aria-label="de dónde cogen ${esc(r.name)} sus consumidores">
+<option value="local">en local</option><option value="pub" ${published.includes(r.name) ? "selected" : ""}>publicada</option></select></label>` : ""}
 <span class="pf-new" style="display:${isNew ? "flex" : "none"};gap:6px;align-items:center;width:100%;padding-left:210px">
 <input type="text" data-pfnew="${esc(r.name)}" aria-label="nombre de la rama nueva" placeholder="nombre de la rama nueva" value="${isNew ? esc(cur) : ""}" oninput="pfRefresh(this.closest('.row'))">
 <span class="hint">a partir de</span>
@@ -1132,6 +1154,8 @@ o.textContent = o.dataset.b + (w ? ` · abierta en ${w}` : "");
 }
 row.querySelector(".pf-new").style.display = val === "__new" ? "flex" : "none";
 row.querySelector(".pf-ro").style.display = wt && val && val !== "__new" ? "inline-flex" : "none";
+const lib = row.querySelector(".pf-lib");
+if (lib) lib.style.display = val && !(wt && val !== "__new" && ro.checked) ? "inline-flex" : "none";
 const want = val === "__new" ? row.querySelector("[data-pfnew]").value.trim() : val;
 const where = val && val !== "__new" && !(wt && ro.checked) ? openAt(r, val, wt ? "wt" : "orig", editingProfile) : null;
 const msgs = [];
@@ -1190,7 +1214,7 @@ function closeProfileForm() { $("#profileForm").style.display = "none"; editingP
 
 function formPayload() {
 const name = $("#pfName").value.trim() || (editingProfile || "");
-const repos = {}, bases = {}, readonly = [];
+const repos = {}, bases = {}, readonly = [], published_libs = [];
 document.querySelectorAll("[data-pfrepo]").forEach(sel => {
 const r = sel.dataset.pfrepo;
 if (sel.value === "__new") {
@@ -1200,10 +1224,12 @@ if (b) { repos[r] = b; bases[r] = document.querySelector(`[data-pfbase="${r}"]`)
 repos[r] = sel.value;
 if (document.querySelector(`[data-pfro="${r}"]`).checked) readonly.push(r);
 }
+const lib = document.querySelector(`[data-pflib="${r}"]`);
+if (repos[r] && lib && lib.value === "pub") published_libs.push(r);
 });
 const svc = formSvcOrder.filter(n => formSvcSelected.has(n));
 const worktree = document.querySelector("input[name=pfMode]:checked").value === "wt";
-return { name, repos, bases, services: svc, worktree, readonly: worktree ? readonly : [] };
+return { name, repos, bases, services: svc, worktree, readonly: worktree ? readonly : [], published_libs };
 }
 
 async function saveProfile() {

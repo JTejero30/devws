@@ -31,6 +31,12 @@ async def app(scope, receive, send):
     if scope["type"] != "http":
         return
     body = os.getcwd().encode()
+    if scope["path"] == "/lib":  # que version de la libreria `lib` ve el servicio
+        try:
+            import libmod
+            body = libmod.VALUE.encode()
+        except ImportError:
+            body = b"sin lib"
     await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
     await send({"type": "http.response.body", "body": body})
 '''
@@ -119,9 +125,9 @@ def wait_for(cond, timeout: float = 60, msg: str = "condicion"):
     raise AssertionError(f"timeout esperando {msg}")
 
 
-def fetch(port: int) -> str | None:
+def fetch(port: int, path: str = "/") -> str | None:
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as r:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=2) as r:
             return r.read().decode()
     except Exception:
         return None
@@ -1531,3 +1537,106 @@ def test_actualizar_todos_los_entornos(ws):
     wait_job(c, "upb")
     r = c.post("/api/cleanup/remove", {"spaces": ["upa", "upb", "upc"], "force": True})
     assert r["ok"], r
+
+
+def restart(c: Client, url: str) -> None:
+    """Reiniciar un servicio como la UI: parar y arrancar."""
+    c.post(f"{url}/down")
+    assert c.post(f"{url}/up")["ok"]
+
+
+def test_libreria_del_espacio_en_local_para_sus_consumidores(ws):
+    """Una libreria en el espacio la usan sus consumidores desde el codigo local
+    (PYTHONPATH), aunque corran desde su carpeta original; con published_libs,
+    la version instalada en su venv. No se toca ningun venv."""
+    c, dws, port = ws["c"], ws["dws"], ws["ports"]["api"]
+    prof = {"name": "libloc", "repos": {"lib": "libloc-a"}, "bases": {"lib": "main"},
+            "services": ["api"], "worktree": True}
+    c.post("/api/profiles", prof)
+    lib_wt = dws / "worktrees" / "libloc__lib"
+    try:
+        prepare(c, "libloc")
+        (lib_wt / "src").mkdir()
+        (lib_wt / "src" / "libmod.py").write_text('VALUE = "v1"\n')
+        assert svc(c, "libloc/api")["local_libs"] == ["lib"]
+        assert next(r for r in c.get("/api/repos") if r["name"] == "lib")["consumers"] == ["api"]
+        c.post("/api/profiles/libloc/start")
+        wait_job(c, "libloc")
+        assert fetch(port, "/lib") == "v1"
+        assert fetch(port) == str(ws["root"] / "api"), "corre desde su carpeta original"
+        assert svc(c, "libloc/api")["local_libs"] == ["lib"]
+        # cambio en la libreria: se ve al reiniciar el servicio, sin pasos a mano
+        (lib_wt / "src" / "libmod.py").write_text('VALUE = "version 2"\n')  # otro tamaño: el .pyc del mismo segundo no vale
+        restart(c, "/api/services/wt/libloc/api")
+        assert fetch(port, "/lib") == "version 2"
+        # publicada: el espacio ya no la cablea; hasta reiniciar se avisa
+        c.put("/api/profiles", {**prof, "published_libs": ["lib"]})
+        assert c.get("/api/profiles/libloc")["published_libs"] == ["lib"]
+        s = svc(c, "libloc/api")
+        assert s["local_libs"] == ["lib"] and s["libs_stale"] == []
+        restart(c, "/api/services/wt/libloc/api")
+        assert fetch(port, "/lib") == "sin lib"
+        s = svc(c, "libloc/api")
+        assert s["local_libs"] == [] and "libs_stale" not in s
+        err, info = mcp_tool(c, "devws_status")
+        assert not err, info
+        space = next(x for x in info["spaces"] if x["name"] == "libloc")
+        assert space["published_libs"] == ["lib"] and "local_libs" not in space["services"][0]
+    finally:
+        c.post("/api/profiles/libloc/stop")
+        wait_job(c, "libloc")
+        c.delete("/api/worktrees/libloc?force=true")
+        c.delete("/api/profiles/libloc")
+
+
+def test_libreria_en_local_en_espacio_in_place(ws):
+    c, root, port = ws["c"], ws["root"], ws["ports"]["api"]
+    mod = root / "lib" / "libmod.py"  # sin src/: la raiz de la libreria
+    mod.write_text('VALUE = "orig"\n')
+    (root / "lib" / ".git" / "info" / "exclude").write_text("libmod.py\n")  # no cuenta como cambio
+    c.post("/api/profiles", {"name": "libin", "repos": {"lib": "feat-a"}, "services": ["api"]})
+    try:
+        c.post("/api/profiles/libin/start")
+        wait_job(c, "libin")
+        assert fetch(port, "/lib") == "orig"
+        assert svc(c, "api")["local_libs"] == ["lib"]
+    finally:
+        c.post("/api/profiles/libin/stop")
+        wait_job(c, "libin")
+        c.delete("/api/profiles/libin")
+        mod.unlink()
+        (root / "lib" / ".git" / "info" / "exclude").write_text("")
+        sh(root / "lib", "git", "checkout", "-q", "main")
+    assert svc(c, "api")["local_libs"] == [], "sin espacio activo, la version instalada"
+
+
+def test_rutas_ignoradas_del_env_se_copian_al_worktree(ws):
+    """El .env del original apunta (CONFIG_PATH) a una carpeta que git ignora:
+    el worktree no la tiene y el servicio fallaria; se copia al arrancarlo."""
+    c, root, dws = ws["c"], ws["root"], ws["dws"]
+    api, exclude = root / "api", root / "api" / ".git" / "info" / "exclude"
+    env_orig = (api / ".env").read_text()
+    (api / "conf" / "local").mkdir(parents=True)
+    (api / "conf" / "local" / "settings.txt").write_text("x")
+    exclude.write_text("conf/\n")
+    (api / ".env").write_text(env_orig + "CONFIG_PATH=conf/local\nURL=http://x/conf\nNADA=no/existe\n")
+    c.post("/api/profiles", {"name": "envp", "repos": {"api": "envp-a"}, "bases": {"api": "main"},
+                             "services": ["api"], "worktree": True})
+    wt = dws / "worktrees" / "envp__api"
+    try:
+        c.post("/api/profiles/envp/start")
+        wait_job(c, "envp")
+        assert (wt / "conf" / "local" / "settings.txt").read_text() == "x"
+        assert not (wt / "no").exists()
+        assert "copiado del repo original" in (dws / "logs" / "envp--api.log").read_text()
+        (wt / "conf" / "local" / "settings.txt").write_text("editado")
+        restart(c, "/api/services/wt/envp/api")
+        assert (wt / "conf" / "local" / "settings.txt").read_text() == "editado", "nunca sobrescribe"
+    finally:
+        c.post("/api/profiles/envp/stop")
+        wait_job(c, "envp")
+        c.delete("/api/worktrees/envp?force=true")
+        c.delete("/api/profiles/envp")
+        (api / ".env").write_text(env_orig)
+        exclude.write_text("")
+        shutil.rmtree(api / "conf")

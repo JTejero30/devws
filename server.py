@@ -303,6 +303,9 @@ class ProfileIn(BaseModel):
     # entorno fijo (p. ej. desa, inte): rama de todos sus repos (en `repos`, las
     # excepciones). Siempre worktree y en solo lectura; ver check_profile
     env_branch: str | None = None
+    # librerias del espacio que sus consumidores usan en su version publicada
+    # (del indice de paquetes) en vez del codigo local; por defecto, el local
+    published_libs: list[str] = []
 
 
 def repo_status(name: str) -> dict:
@@ -358,6 +361,9 @@ def api_repos():
             st["kind"] = r["kind"]
             st["startup"] = repo_startup(r["name"])
             st["install"] = install_cmd(r)
+            lib = next((l for l in CONFIG.get("libraries", []) if l["name"] == r["name"]), None)
+            if lib:
+                st["consumers"] = lib.get("consumers", [])
             out.append(st)
         except Exception as e:
             out.append({"name": r["name"], "error": str(e)})
@@ -1009,8 +1015,66 @@ def wt_copy_ignored(name: str, d: Path) -> None:
             shutil.copy2(src, dst)
 
 
+def wt_copy_env_paths(src_root: Path, d: Path) -> list[str]:
+    """Rutas relativas del .env del repo original (p. ej. CONFIG_PATH=infra/
+    environments/local) que git ignora y que el worktree no tiene: se copian del
+    original para que el servicio arranque (sin ellas falla al leer su config).
+    Nunca sobrescribe. Devuelve las copiadas."""
+    out = []
+    for v in load_dotenv(src_root).values():
+        rel = Path(v)
+        if not v or "://" in v or rel.is_absolute() or ".." in rel.parts or str(rel) == ".":
+            continue
+        src, dst = src_root / rel, d / rel
+        if not src.exists() or dst.exists():
+            continue
+        ignored = subprocess.run(["git", "-C", str(src_root), "check-ignore", "-q", str(rel)],
+                                 capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+        if ignored.returncode != 0:
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+        out.append(v)
+    return out
+
+
 def wt_dir_for(profile: str, repo: str) -> Path:
     return WT_DIR / f"{profile}__{repo}"
+
+
+def local_libs(sid: str, state: dict | None = None) -> list[tuple[str, Path]]:
+    """Librerias (python) que el servicio usa desde el codigo local de su espacio
+    en vez de la version instalada en su venv: las de `[[libraries]]` de las que
+    su repo es consumidor, que estan en el espacio (no en solo lectura) y que el
+    perfil no pide publicadas (`published_libs`). Se ponen en el PYTHONPATH del
+    servicio (`src/` si la libreria la tiene): no se toca ningun venv, asi que
+    no hay nada que desmontar al quitarla del espacio. (nombre, carpeta)."""
+    svc = service(sid.split("/")[-1])
+    prof_name, _ = _split_svc_id(sid)
+    if prof_name is None:  # servicio base: el del espacio in-place activo, si lo hay
+        prof_name = (state or load_state()).get("active_profile")
+        prof = load_profile(prof_name) if prof_name else None
+        if prof is None or prof.get("worktree"):
+            return []
+    else:
+        prof = load_profile(prof_name)
+        if prof is None:
+            return []
+    off = set(prof.get("readonly", [])) | set(prof.get("published_libs", []))
+    kinds = {r["name"]: r.get("kind", "python") for r in repos()}
+    out = []
+    for lib in CONFIG.get("libraries", []):
+        n = lib["name"]
+        if (svc["repo"] not in lib.get("consumers", []) or n not in prof.get("repos", {})
+                or n in off or kinds.get(n) != "python"):
+            continue
+        d = wt_dir_for(prof_name, n) if prof.get("worktree") else repo_path(n)
+        if d.is_dir():
+            out.append((n, d / "src" if (d / "src").is_dir() else d))
+    return out
 
 
 def readonly_ref(p: Path, name: str, branch: str) -> str:
@@ -1233,6 +1297,12 @@ def _start_service(svc: dict, port: int, killed: list,
     dotenv_p = repo_path(svc["repo"]) if wt_dir is not None else p
     for k, v in load_dotenv(dotenv_p).items():
         env.setdefault(k, v)
+    copied = wt_copy_env_paths(dotenv_p, p) if wt_dir is not None else []
+    libs = local_libs(name)
+    if libs:
+        # el codigo local de la libreria por delante de la version instalada en el venv
+        env["PYTHONPATH"] = os.pathsep.join([*(str(d) for _, d in libs),
+                                             *([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])])
     exclude = {os.getpid()}
     logf_path = log_file_for(name)
     cmd = [a.replace("{port}", str(port)) for a in svc["cmd"]]
@@ -1244,6 +1314,9 @@ def _start_service(svc: dict, port: int, killed: list,
         if attempt == 1:
             with open(logf_path, "wb") as f:
                 f.write(f"=== up {name} {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode())
+                if copied:
+                    f.write(f"devws: copiado del repo original (lo nombra su .env y git lo ignora): "
+                            f"{', '.join(copied)}\n".encode())
         with open(logf_path, "ab") as logf:
             proc = subprocess.Popen(
                 cmd, cwd=p, stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
@@ -1258,6 +1331,8 @@ def _start_service(svc: dict, port: int, killed: list,
                  "branch": branch}
         if wt_dir is not None:
             entry["wt"] = wt_dir.name
+        if libs:
+            entry["libs"] = [n for n, _ in libs]
         with state_tx() as st:
             st["services"][name] = entry
         if wait_port(port, timeout=90, proc=proc):
@@ -1329,6 +1404,15 @@ def service_status(name: str, svc: dict, state: dict, conns: list | None = None)
         out["wt"] = True
         out["profile"] = prof
         out["from_original"] = wt_dir is None
+    # librerias que usa en local: las que tenia al arrancar si corre (libs_stale:
+    # el espacio ya pide otras, hay que reiniciarlo); si no, las que tendra
+    want = [n for n, _ in local_libs(name, state)]
+    if alive:
+        out["local_libs"] = entry.get("libs", [])
+        if out["local_libs"] != want:
+            out["libs_stale"] = want
+    else:
+        out["local_libs"] = want
     try:
         out["repo_branch"] = git(p, "branch", "--show-current", timeout=5).strip() or None
     except Exception:
@@ -1509,6 +1593,9 @@ def profile_body(req: ProfileIn, created_at: str | None = None) -> str:
     readonly = [r for r in req.readonly if r in req.repos]
     if readonly:
         body.append("readonly = [" + ", ".join(toml_str(r) for r in readonly) + "]")
+    published = [r for r in dict.fromkeys(req.published_libs) if r in req.repos]
+    if published:
+        body.append("published_libs = [" + ", ".join(toml_str(r) for r in published) + "]")
     body += ["", "[repos]"]
     body += [f'{toml_str(r)} = {toml_str(b)}' for r, b in req.repos.items()]
     bases = {r: b for r, b in req.bases.items() if r in req.repos and r not in readonly and b}
@@ -1522,7 +1609,7 @@ def profile_in(name: str, prof: dict) -> ProfileIn:
     return ProfileIn(name=name, repos=prof.get("repos", {}), worktree=bool(prof.get("worktree")),
                      services=prof.get("services", {}).get("services", []),
                      bases=prof.get("bases", {}), readonly=prof.get("readonly", []),
-                     env_branch=prof.get("env_branch"))
+                     env_branch=prof.get("env_branch"), published_libs=prof.get("published_libs", []))
 
 
 BRANCH_RE = r"[A-Za-z0-9._/-]+"
@@ -2831,6 +2918,11 @@ Reglas:
   pararlo con devws_stop_environment); no se desarrolla en ellos ni se hacen
   commits. Por repo, behind = commits de origin que aun no tiene (se ponen al
   dia al levantarlo). Los crea y edita el usuario desde la UI.
+- Librerias: si una libreria (libraries) esta en el espacio (y no en solo
+  lectura), los servicios que la consumen la usan desde el codigo local del
+  espacio (local_libs del servicio; va en su PYTHONPATH), aunque el servicio
+  corra desde su carpeta original. Un cambio en la libreria se ve al reiniciar
+  el servicio. Para usar la version publicada: published_libs.
 - Estado de un servicio: up, starting, down, crashed (devws lo arranco y su
   proceso murio: mira su log), other_space (su puerto lo usa el servicio de otro
   espacio, en owner) o external (lo usa algo que no es de devws).
@@ -2897,7 +2989,8 @@ def space_info(name: str) -> dict:
         "dirs": {r: str(wt_dir_for(name, r) if is_wt else repo_path(r))
                  for r in prof.get("repos", {}) if r in known},
         "active": state.get("active_profile") == name,
-        "services": [{k: st[k] for k in ("name", "port", "status")}
+        "published_libs": prof.get("published_libs", []),
+        "services": [{k: st[k] for k in ("name", "port", "status", "local_libs") if st.get(k) or k != "local_libs"}
                      for st in (service_status(i, service(i.split("/")[-1]), state, conns) for i in svc_ids)],
     }
 
@@ -2945,7 +3038,8 @@ def devws_status() -> dict:
 @mcp.tool()
 def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, str] | None = None,
                            services: list[str] | None = None, start: bool = False,
-                           readonly: list[str] | None = None) -> dict:
+                           readonly: list[str] | None = None,
+                           published_libs: list[str] | None = None) -> dict:
     """Crea (o amplia, si ya existe) un espacio worktree: deja cada worktree en
     su rama, sin instalar dependencias (se instalan al arrancar o con
     devws_install_deps). Devuelve en `dirs` la ruta de cada worktree: edita ahi.
@@ -2957,6 +3051,10 @@ def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, st
       servicio que debe correr en desa): su worktree queda en lo ultimo de la
       rama sin abrirla (HEAD detached), asi otros espacios pueden usar la misma
       rama a la vez. No hagas commits en ellos.
+    published_libs: NO lo pases salvo que el usuario lo pida. Una libreria
+      (libraries) que esta en el espacio la usan sus consumidores desde el codigo
+      local del espacio (local_libs de cada servicio); las de esta lista, desde
+      su version publicada (la instalada en su venv).
     services: NO lo pases salvo que el usuario pida arrancar solo algunos: sin
       el, el espacio arranca todos los servicios (los de repos que no estan en el
       espacio corren desde su carpeta original).
@@ -2971,13 +3069,15 @@ def devws_create_workspace(name: str, repos: dict[str, str], bases: dict[str, st
         tool_call(repo_path, r)
     if old is None:
         req = ProfileIn(name=name, repos=repos, worktree=True, services=services or [], bases=bases or {},
-                        readonly=readonly or [])
+                        readonly=readonly or [], published_libs=published_libs or [])
         tool_call(api_profiles_save, req)
     else:
         req = profile_in(name, old)
         req.repos = {**req.repos, **repos}
         req.bases = {**req.bases, **(bases or {})}
         req.readonly = [r for r in req.readonly if r not in repos] + (readonly or [])
+        if published_libs is not None:
+            req.published_libs = published_libs
         if services is not None:
             req.services = services
         tool_call(api_profiles_update, req)
